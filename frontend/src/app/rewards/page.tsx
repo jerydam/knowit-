@@ -1,98 +1,68 @@
 'use client';
-import { useState, useEffect } from 'react';
-import { ethers } from 'ethers';
 import { RewardsPanel } from '@/components/RewardsPanel';
-import type { UserScore } from '@/types/quiz';
 import Link from 'next/link';
 import { ConnectWallet } from '@/components/ConnectWallet';
-import { QuizRewardsABI } from '@/lib/QuizAbi';
-
-interface Window {
-  ethereum?: {
-    request: (args: { method: string; params?: any[] }) => Promise<any>;
-    on: (event: string, callback: (accounts: string[]) => void) => void;
-  };
-}
+import { useWallet } from '@/components/context/WalletContext';
+import { Toaster } from 'react-hot-toast';
 
 export default function RewardsPage() {
-  const [userAddress, setUserAddress] = useState<string | null>(null);
-  const [isConnected, setIsConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const contractAddress = process.env.NEXT_PUBLIC_QUIZ_CONTRACT_ADDRESS!;
-
-  useEffect(() => {
-    const fetchUserData = async () => {
-      if (typeof window === 'undefined' || !window.ethereum) {
-        setError('MetaMask not detected. Please install MetaMask.');
-        return;
-      }
-
-      try {
-        const provider = new ethers.BrowserProvider(window.ethereum);
-        const accounts = await provider.send('eth_requestAccounts', []);
-        if (accounts.length === 0) {
-          setError('No wallet accounts found.');
-          return;
-        }
-        setUserAddress(accounts[0]);
-        setIsConnected(true);
-        console.log('Wallet connected:', accounts[0]);
-      } catch (err: any) {
-        console.error('Error fetching user data:', err);
-        setError('Failed to connect wallet: ' + err.message);
-      }
-    };
-    fetchUserData();
-
-    if (window.ethereum) {
-      window.ethereum.on('accountsChanged', (accounts: string[]) => {
-        setUserAddress(accounts[0] || null);
-        setIsConnected(!!accounts[0]);
-        fetchUserData();
-      });
-    }
-  }, []);
+  // Use the central wallet context instead of local state
+  const { userAddress, isConnected, isMiniPay, error: walletError } = useWallet();
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-black text-white py-12 px-4 sm:px-6 lg:px-8">
+    // Updated Background: Blue/Slate Gradient (Knowledge Theme)
+    <div className="min-h-screen bg-gradient-to-b from-slate-900 via-blue-950 to-slate-900 text-white py-8 sm:py-12 px-4 sm:px-6 lg:px-8">
+      <Toaster position="bottom-center" />
+      
       <div className="max-w-5xl mx-auto">
         <header className="text-center mb-12">
-          <h1 className="text-5xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-500">
-            🏆 Your Rewards
+          <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight mb-4">
+            <span className="bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-cyan-300">
+              Your
+            </span>{' '}
+            <span className="bg-clip-text text-transparent bg-gradient-to-r from-yellow-300 to-orange-400">
+              Rewards
+            </span>
           </h1>
-          <p className="mt-3 text-lg text-gray-300">
-            View your quiz achievements and claim your NFTs on the Celo blockchain
+          <p className="mt-3 text-lg text-slate-300 max-w-2xl mx-auto">
+            Track your learning journey. Earn NFTs for every perfect score and build your on-chain knowledge profile.
           </p>
         </header>
 
-        {error && (
-          <div className="mb-8 p-4 bg-red-500/20 text-red-300 rounded-lg text-center">
-            {error}
+        {walletError && (
+          <div className="mb-8 p-4 bg-red-500/20 border border-red-500/50 text-red-200 rounded-xl text-center">
+            {walletError}
           </div>
         )}
 
-        <div className="flex justify-center mb-8">
-          {userAddress ? (
-            <div className="flex items-center space-x-3 bg-gray-800/50 rounded-full px-4 py-2 border border-blue-500/30">
-              <span className="text-sm text-blue-300">
-                Connected: {userAddress.slice(0, 6)}...{userAddress.slice(-4)}
+        <div className="flex justify-center mb-10">
+          {isConnected ? (
+            <div className="flex items-center space-x-3 bg-slate-800/80 backdrop-blur-sm rounded-full px-6 py-2 border border-blue-500/30 shadow-lg shadow-blue-500/10">
+              <span className="text-sm font-medium text-blue-200">
+                {isMiniPay ? '📱 MiniPay Connected' : 'Wallet Connected'}:
               </span>
-              <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
+              <span className="font-mono text-yellow-400 font-bold">
+                 {userAddress?.slice(0, 6)}...{userAddress?.slice(-4)}
+              </span>
             </div>
           ) : (
+            // ConnectWallet handles the specific button logic (hides if MiniPay)
             <ConnectWallet />
           )}
         </div>
 
         <main>
-          <RewardsPanel
-            userAddress={userAddress}
-            isConnected={isConnected}
+          {/* Pass isMiniPay to panel to handle gas logic */}
+          <RewardsPanel 
+            userAddress={userAddress} 
+            isConnected={isConnected} 
+            isMiniPay={isMiniPay} 
           />
-          <div className="mt-6 text-center">
+          
+          <div className="mt-12 text-center">
             <Link href="/">
-              <button className="px-6 py-3 bg-gray-600 hover:bg-gray-700 text-white font-semibold rounded-lg transition-all duration-300">
-                ← Back to Home
+              <button className="px-8 py-3 bg-slate-700 hover:bg-slate-600 text-white font-semibold rounded-xl transition-all duration-300 hover:shadow-lg hover:-translate-y-1 border border-slate-600">
+                ← Back to Dashboard
               </button>
             </Link>
           </div>

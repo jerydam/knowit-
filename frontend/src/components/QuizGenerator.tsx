@@ -2,18 +2,21 @@
 import { useState } from 'react';
 import { ethers } from 'ethers';
 import { createWalletClient, custom } from 'viem';
-import { celo, celoAlfajores } from 'viem/chains';
+import { celo } from 'viem/chains';
 import { QuizRewardsABI } from '@/lib/QuizAbi';
 import { sendTransactionWithDivvi } from '@/lib/divvi';
 import { useWallet } from '@/components/context/WalletContext';
 import toast from 'react-hot-toast';
 import type { Quiz } from '@/types/quiz';
 
+const CUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a";
+
 interface QuizGeneratorProps {
   onQuizGenerated: (quiz: Quiz) => void;
+  onCancel?: () => void;
 }
 
-export function QuizGenerator({ onQuizGenerated }: QuizGeneratorProps) {
+export function QuizGenerator({ onQuizGenerated, onCancel }: QuizGeneratorProps) {
   const [topic, setTopic] = useState('');
   const [difficulty, setDifficulty] = useState<'beginner' | 'intermediate' | 'advanced'>('beginner');
   const [questionCount, setQuestionCount] = useState(5);
@@ -21,7 +24,7 @@ export function QuizGenerator({ onQuizGenerated }: QuizGeneratorProps) {
   const [isGenerating, setIsGenerating] = useState(false);
   const [currentStep, setCurrentStep] = useState<'form' | 'generating' | 'storing' | 'blockchain'>('form');
   
-  const { userAddress, isConnected } = useWallet();
+  const { userAddress, isConnected, isMiniPay } = useWallet();
   const contractAddress = process.env.NEXT_PUBLIC_QUIZ_CONTRACT_ADDRESS;
 
   const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -36,56 +39,41 @@ export function QuizGenerator({ onQuizGenerated }: QuizGeneratorProps) {
   };
 
   const generateQuiz = async () => {
-    console.log('🚀 Starting quiz generation process...');
-    console.log('📋 Input data:', { topic, difficulty, questionCount, hasImage: !!image, userAddress });
-
     if (!isConnected || !userAddress) {
-      toast.error('Please connect your wallet first');
+      toast.error('Connect wallet first');
       return;
     }
-
     if (!topic.trim() || !image) {
-      toast.error('Please fill in all fields and select an image');
-      return;
-    }
-
-    if (!contractAddress) {
-      toast.error('Contract address is not configured');
+      toast.error('Please add a topic and an image');
       return;
     }
 
     setIsGenerating(true);
     setCurrentStep('generating');
+    // Optional: Initial toast
+    toast('Starting Quiz Generation...', { icon: '🚀' });
 
     try {
-      // Step 1: Generate questions
-      console.log('🎯 Step 1: Generating questions...');
-      toast.loading('Generating questions...');
-
-      const questionsResponse = await fetch('/api/generateQuestions', {
+      // =================================================
+      // STAGE 1: AI GENERATION
+      // =================================================
+      const qRes = await fetch('/api/generateQuestions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic, difficulty, count: questionCount }),
       });
-
-      if (!questionsResponse.ok) {
-        const errorData = await questionsResponse.json();
-        console.error('❌ Failed to generate questions:', errorData);
-        throw new Error(errorData.error || 'Failed to generate questions');
-      }
-
-      const questions = await questionsResponse.json();
-      console.log('✅ Questions generated successfully:', questions);
-      console.log('📊 Generated questions count:', questions.length);
-
-      toast.dismiss();
-      toast.success('Questions generated successfully!');
+      
+      if (!qRes.ok) throw new Error('Failed to generate questions');
+      const questions = await qRes.json();
+      
+      // NOTIFICATION: Stage 1 Complete
+      toast.success('Stage 1/3 Complete: Questions Generated');
+      
       setCurrentStep('storing');
 
-      // Step 2: Store quiz in database
-      console.log('💾 Step 2: Storing quiz in database...');
-      toast.loading('Storing quiz in database...');
-
+      // =================================================
+      // STAGE 2: STORAGE & UPLOAD
+      // =================================================
       const formData = new FormData();
       formData.append('topic', topic);
       formData.append('difficulty', difficulty);
@@ -94,271 +82,177 @@ export function QuizGenerator({ onQuizGenerated }: QuizGeneratorProps) {
       formData.append('userAddress', userAddress);
       formData.append('questions', JSON.stringify(questions));
 
-      console.log('📤 Sending data to database API...');
-      const storeResponse = await fetch('/api/storeQuiz', {
-        method: 'POST',
-        body: formData,
-      });
+      const sRes = await fetch('/api/storeQuiz', { method: 'POST', body: formData });
+      if (!sRes.ok) throw new Error('Failed to store quiz');
+      
+      const { quiz } = await sRes.json();
 
-      if (!storeResponse.ok) {
-        const errorData = await storeResponse.json();
-        console.error('❌ Failed to store quiz:', errorData);
-        throw new Error(errorData.error || 'Failed to store quiz in database');
-      }
+      // NOTIFICATION: Stage 2 Complete
+      toast.success('Stage 2/3 Complete: Assets Uploaded');
 
-      const { quiz } = await storeResponse.json();
-      console.log('✅ Quiz stored in database successfully:', quiz);
-      console.log('🆔 Generated Quiz ID:', quiz.id);
-      console.log('🖼️ NFT Metadata:', quiz.nftMetadata);
-
-      toast.dismiss();
-      toast.success('Quiz stored in database!');
       setCurrentStep('blockchain');
 
-      // Step 3: Send quiz ID to smart contract
-      console.log('⛓️ Step 3: Sending quiz ID to smart contract...');
-      toast.loading('Creating quiz on blockchain...');
-
-      if (typeof window === 'undefined' || !window.ethereum) {
-        throw new Error('No wallet provider detected');
-      }
-
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
+      // =================================================
+      // STAGE 3: BLOCKCHAIN MINTING
+      // =================================================
+      let txHash;
       
-      console.log('🌐 Current network chain ID:', currentChainId);
-
-      // Support both Celo mainnet and testnet
-      const supportedChains = [42220, 44787];
-      if (!supportedChains.includes(currentChainId)) {
-        console.log('🔄 Switching to supported network...');
-        try {
-          await window.ethereum.request({
-            method: 'wallet_switchEthereumChain',
-            params: [{ chainId: `0x${(42220).toString(16)}` }],
-          });
-        } catch (switchError: any) {
-          if (switchError.code === 4902) {
-            try {
-              await window.ethereum.request({
-                method: 'wallet_switchEthereumChain',
-                params: [{ chainId: `0x${(44787).toString(16)}` }],
-              });
-            } catch {
-              throw new Error('Please switch to Celo network');
-            }
-          } else {
-            throw new Error('Please switch to Celo network');
-          }
-        }
+      // --- MINIPAY LOGIC ---
+      if (isMiniPay) {
+        const walletClient = createWalletClient({
+            chain: celo,
+            transport: custom(window.ethereum!)
+        });
+        
+        txHash = await walletClient.writeContract({
+            address: contractAddress as `0x${string}`,
+            abi: QuizRewardsABI,
+            functionName: 'createQuiz',
+            account: userAddress as `0x${string}`,
+            args: [BigInt(quiz.id), quiz.title, quiz.nftMetadata],
+            feeCurrency: CUSD_ADDRESS as `0x${string}`
+        });
+      } 
+      // --- STANDARD LOGIC ---
+      else {
+        const provider = new ethers.BrowserProvider(window.ethereum!);
+        const signer = await provider.getSigner();
+        const contract = new ethers.Contract(contractAddress!, QuizRewardsABI, signer);
+        const walletClient = createWalletClient({
+            chain: celo,
+            transport: custom(window.ethereum!)
+        });
+        
+        txHash = await sendTransactionWithDivvi(
+            contract, 
+            'createQuiz', 
+            [quiz.id, quiz.title, quiz.nftMetadata], 
+            walletClient, 
+            provider
+        );
       }
 
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(contractAddress, QuizRewardsABI, signer);
-      const walletClient = createWalletClient({
-        chain: currentChainId === 44787 ? celoAlfajores : celo,
-        transport: custom(window.ethereum),
-      });
-
-      console.log('📄 Contract details:', {
-        address: contractAddress,
-        quizId: quiz.id,
-        title: quiz.title,
-        nftMetadata: quiz.nftMetadata
-      });
-
-      // Send transaction to create quiz on contract
-      console.log('📝 Calling smart contract createQuiz function...');
-      const txHash = await sendTransactionWithDivvi(
-        contract,
-        'createQuiz',
-        [quiz.id, quiz.title, quiz.nftMetadata],
-        walletClient,
-        provider
-      );
-
-      console.log('✅ Transaction sent successfully!');
-      console.log('🔗 Transaction hash:', txHash);
-
-      // Update database with transaction hash
-      console.log('🔄 Updating database with transaction hash...');
-      const updateResponse = await fetch('/api/updateQuizTransaction', {
+      // 4. Update DB with Hash
+      await fetch('/api/updateQuizTransaction', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ quizId: quiz.id, transactionHash: txHash }),
       });
 
-      if (updateResponse.ok) {
-        console.log('✅ Database updated with transaction hash');
-      } else {
-        console.warn('⚠️ Failed to update database with transaction hash');
-      }
-
-      toast.dismiss();
-      toast.success('Quiz created successfully on blockchain!');
-      
-      // Reset form
-      console.log('🔄 Resetting form...');
-      setTopic('');
-      setDifficulty('beginner');
-      setQuestionCount(5);
-      setImage(null);
-      setCurrentStep('form');
+      // NOTIFICATION: Stage 3 Complete (Final)
+      toast.success('Stage 3/3 Complete: Quiz Minted on Celo!');
       
       onQuizGenerated({ ...quiz, transactionHash: txHash });
-      
-      console.log('🎉 Quiz generation process completed successfully!');
-      console.log('📋 Final quiz data:', { ...quiz, transactionHash: txHash });
 
     } catch (error: any) {
-      console.error('💥 Error in quiz generation process:', {
-        message: error.message,
-        code: error.code,
-        step: currentStep,
-        stack: error.stack
-      });
-      
-      let errorMessage = error.message || 'Failed to create quiz';
-      
-      if (error.code === 'INSUFFICIENT_FUNDS') {
-        errorMessage = 'Insufficient funds for gas. Please fund your wallet with CELO.';
-      } else if (error.message.includes('User rejected')) {
-        errorMessage = 'Transaction was rejected by user.';
-      }
-      
-      toast.dismiss();
-      toast.error(errorMessage);
+      console.error(error);
+      toast.error(error.message || 'Failed to create quiz');
       setCurrentStep('form');
     } finally {
       setIsGenerating(false);
-      console.log('🏁 Quiz generation process ended');
     }
   };
 
-  const getStepMessage = () => {
-    switch (currentStep) {
-      case 'generating':
-        return {
-          title: 'Generating Questions',
-          description: 'Creating quiz questions using AI...'
-        };
-      case 'storing':
-        return {
-          title: 'Storing Quiz',
-          description: 'Saving quiz data and uploading image to IPFS...'
-        };
-      case 'blockchain':
-        return {
-          title: 'Creating on Blockchain',
-          description: 'Sending quiz ID to smart contract...'
-        };
-      default:
-        return null;
-    }
-  };
-
-  const stepMessage = getStepMessage();
-
-  if (stepMessage) {
+  // --- LOADING UI ---
+  if (currentStep !== 'form') {
     return (
-      <div className="max-w-2xl mx-auto bg-gray-800/40 backdrop-blur-sm rounded-2xl p-8 border border-blue-500/20">
+      <div className="max-w-xl mx-auto bg-slate-800 rounded-2xl p-8 border border-slate-700 shadow-2xl">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-400 mx-auto mb-4"></div>
-          <h3 className="text-xl font-semibold text-blue-200 mb-2">{stepMessage.title}</h3>
-          <p className="text-gray-300">{stepMessage.description}</p>
-          
-          {/* Progress indicator */}
-          <div className="mt-6">
-            <div className="flex justify-center space-x-4 mb-2">
-              <div className={`w-3 h-3 rounded-full ${currentStep === 'generating' || currentStep === 'storing' || currentStep === 'blockchain' ? 'bg-blue-400' : 'bg-gray-600'}`}></div>
-              <div className={`w-3 h-3 rounded-full ${currentStep === 'storing' || currentStep === 'blockchain' ? 'bg-blue-400' : 'bg-gray-600'}`}></div>
-              <div className={`w-3 h-3 rounded-full ${currentStep === 'blockchain' ? 'bg-blue-400' : 'bg-gray-600'}`}></div>
-            </div>
-            <div className="text-sm text-gray-400">
-              Step {currentStep === 'generating' ? '1' : currentStep === 'storing' ? '2' : '3'} of 3
-            </div>
-          </div>
+          <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-blue-500 border-r-transparent mx-auto mb-6"></div>
+          <h3 className="text-2xl font-bold text-white mb-2">
+            {currentStep === 'generating' && 'Step 1: Generating AI Questions...'}
+            {currentStep === 'storing' && 'Step 2: Uploading Assets to IPFS...'}
+            {currentStep === 'blockchain' && (isMiniPay ? 'Step 3: Confirm in MiniPay...' : 'Step 3: Confirm Wallet Transaction...')}
+          </h3>
+          <p className="text-slate-400">
+            {currentStep === 'generating' && 'This usually takes 5-10 seconds.'}
+            {currentStep === 'storing' && 'Securing your data...'}
+            {currentStep === 'blockchain' && 'Please verify the transaction in your wallet.'}
+          </p>
         </div>
       </div>
     );
   }
 
+  // --- FORM UI ---
   return (
-    <div className="max-w-2xl mx-auto bg-gray-800/40 backdrop-blur-sm rounded-2xl p-8 border border-blue-500/20">
-      <h2 className="text-3xl font-bold text-center text-blue-200 mb-8">Create New Quiz</h2>
+    <div className="max-w-2xl mx-auto bg-slate-800/80 backdrop-blur rounded-2xl p-8 border border-slate-700 shadow-xl">
+      <div className="flex justify-between items-center mb-8">
+        <h2 className="text-2xl font-bold text-white">Create AI Quiz</h2>
+        {onCancel && (
+            <button onClick={onCancel} className="text-slate-400 hover:text-white">✕</button>
+        )}
+      </div>
       
       <div className="space-y-6">
         <div>
-          <label className="block text-sm font-medium text-gray-300 mb-2">Topic</label>
+          <label className="block text-sm font-medium text-slate-300 mb-2">Topic</label>
           <input
             type="text"
             value={topic}
             onChange={(e) => setTopic(e.target.value)}
-            placeholder="e.g., Web3, Blockchain, DeFi"
-            className="w-full px-4 py-3 bg-gray-700/50 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            placeholder="e.g., DeFi, Celo History, NFTs"
+            className="w-full px-4 py-3 bg-slate-900 border border-slate-600 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
           />
         </div>
 
-        <div>
-          <label className="block text-sm font-medium text-gray-300 mb-2">Difficulty</label>
-          <select
-            value={difficulty}
-            onChange={(e) => setDifficulty(e.target.value as 'beginner' | 'intermediate' | 'advanced')}
-            className="w-full px-4 py-3 bg-gray-700/50 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="beginner">Beginner</option>
-            <option value="intermediate">Intermediate</option>
-            <option value="advanced">Advanced</option>
-          </select>
+        <div className="grid grid-cols-2 gap-4">
+            <div>
+            <label className="block text-sm font-medium text-slate-300 mb-2">Difficulty</label>
+            <select
+                value={difficulty}
+                onChange={(e) => setDifficulty(e.target.value as any)}
+                className="w-full px-4 py-3 bg-slate-900 border border-slate-600 rounded-xl text-white focus:border-blue-500 outline-none"
+            >
+                <option value="beginner">Beginner</option>
+                <option value="intermediate">Intermediate</option>
+                <option value="advanced">Advanced</option>
+            </select>
+            </div>
+
+            <div>
+            <label className="block text-sm font-medium text-slate-300 mb-2">Questions</label>
+            <input
+                type="number"
+                min="1"
+                max="10"
+                value={questionCount}
+                onChange={(e) => setQuestionCount(parseInt(e.target.value))}
+                className="w-full px-4 py-3 bg-slate-900 border border-slate-600 rounded-xl text-white focus:border-blue-500 outline-none"
+            />
+            </div>
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-gray-300 mb-2">Number of Questions</label>
-          <input
-            type="number"
-            min="1"
-            max="20"
-            value={questionCount}
-            onChange={(e) => setQuestionCount(Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))}
-            className="w-full px-4 py-3 bg-gray-700/50 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
+          <label className="block text-sm font-medium text-slate-300 mb-2">NFT Image</label>
+          <div className="border-2 border-dashed border-slate-600 rounded-xl p-6 text-center hover:border-blue-500 transition-colors bg-slate-900/50">
+            <input
+                type="file"
+                accept="image/*"
+                id="file-upload"
+                onChange={handleImageChange}
+                className="hidden"
+            />
+            <label htmlFor="file-upload" className="cursor-pointer flex flex-col items-center">
+                {image ? (
+                    <span className="text-green-400 font-medium">{image.name}</span>
+                ) : (
+                    <>
+                        <span className="text-slate-400 text-sm">Click to upload NFT Cover Image</span>
+                        <span className="text-xs text-slate-500 mt-1">(Max 5MB)</span>
+                    </>
+                )}
+            </label>
+          </div>
         </div>
 
-        <div>
-          <label className="block text-sm font-medium text-gray-300 mb-2">NFT Image (Max 5MB)</label>
-          <input
-            type="file"
-            accept="image/*"
-            onChange={handleImageChange}
-            className="w-full px-4 py-3 bg-gray-700/50 border border-gray-600 rounded-lg text-white file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-500 file:text-white hover:file:bg-blue-600"
-          />
-          {image && (
-            <p className="text-sm text-gray-400 mt-2">Selected: {image.name}</p>
-          )}
-        </div>
-
-        <div className="flex gap-4">
-          <button
-            onClick={generateQuiz}
-            disabled={isGenerating || !isConnected}
-            className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-600 hover:to-purple-600 disabled:from-gray-600 disabled:to-gray-600 text-white font-semibold rounded-lg transition-all duration-300"
-          >
-            {isGenerating ? 'Creating Quiz...' : 'Create Quiz'}
-          </button>
-          
-          <button
-            onClick={() => {
-              setTopic('');
-              setDifficulty('beginner');
-              setQuestionCount(5);
-              setImage(null);
-            }}
-            className="px-6 py-3 bg-gray-600 hover:bg-gray-700 text-white font-semibold rounded-lg transition-all duration-300"
-          >
-            Reset
-          </button>
-        </div>
+        <button
+          onClick={generateQuiz}
+          disabled={isGenerating || !isConnected}
+          className="w-full py-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold rounded-xl shadow-lg shadow-blue-900/20 transition-all transform active:scale-95 disabled:opacity-50 disabled:transform-none"
+        >
+          {isGenerating ? 'Processing...' : 'Generate & Mint Quiz'}
+        </button>
       </div>
     </div>
   );

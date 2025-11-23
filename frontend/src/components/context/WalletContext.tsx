@@ -9,14 +9,9 @@ interface WalletContextType {
   isConnected: boolean;
   isFarcaster: boolean;
   isMiniApp: boolean; 
-  isMiniPay: boolean; // Added specific flag for MiniPay
+  isMiniPay: boolean; 
   error: string | null;
-  setWalletState: (state: {
-    userAddress: string | null;
-    username: string | null;
-    isConnected: boolean;
-    error: string | null;
-  }) => void;
+  setWalletState: (state: any) => void;
 }
 
 const WalletContext = createContext<WalletContextType | undefined>(undefined);
@@ -33,30 +28,30 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
-    // 1. Detect Environment
+    // 1. Detect Environment Flags
     const userAgent = navigator.userAgent.toLowerCase();
     const url = new URL(window.location.href);
     
     const isFarcasterApp = userAgent.includes('warpcast') || url.searchParams.has('farcaster');
     const isMini = url.pathname.startsWith('/mini') || url.searchParams.get('miniApp') === 'true';
-    
-    // Check for MiniPay injection
-    // @ts-ignore
-    const isMiniPayDetected = window.ethereum && window.ethereum.isMiniPay === true;
 
     setIsFarcaster(isFarcasterApp);
     setIsMiniApp(isMini);
-    setIsMiniPay(!!isMiniPayDetected);
 
-    // 2. Auto-Connect if MiniPay
-    const autoConnectMiniPay = async () => {
-      if (isMiniPayDetected) {
+    // 2. MiniPay Detection & Auto-Connect Function
+    const checkMiniPay = async () => {
+      // @ts-ignore
+      if (window.ethereum && window.ethereum.isMiniPay) {
+        console.log("MiniPay Detected!");
+        setIsMiniPay(true);
+        
         try {
-          // MiniPay connection is implicit, we just grab the address
+          // Auto-Connect Logic for MiniPay
           const client = createWalletClient({
             chain: celo,
-            transport: custom(window.ethereum!)
+            transport: custom(window.ethereum)
           });
+          
           const [address] = await client.requestAddresses();
           
           if (address) {
@@ -69,25 +64,24 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       }
     };
 
-    autoConnectMiniPay();
+    // 3. Run check immediately
+    checkMiniPay();
+
+    // 4. Run check again if 'ethereum#initialized' event fires
+    // (Fixes race condition where provider injects slightly after load)
+    window.addEventListener('ethereum#initialized', checkMiniPay, { once: true });
+
+    return () => {
+        window.removeEventListener('ethereum#initialized', checkMiniPay);
+    }
 
   }, []);
 
-  const setWalletState = ({
-    userAddress,
-    username,
-    isConnected,
-    error,
-  }: {
-    userAddress: string | null;
-    username: string | null;
-    isConnected: boolean;
-    error: string | null;
-  }) => {
-    setUserAddress(userAddress);
-    setUsername(username ?? null);
-    setIsConnected(isConnected);
-    setError(error);
+  const setWalletState = (state: any) => {
+    if(state.userAddress) setUserAddress(state.userAddress);
+    if(state.username !== undefined) setUsername(state.username);
+    if(state.isConnected !== undefined) setIsConnected(state.isConnected);
+    if(state.error !== undefined) setError(state.error);
   };
 
   return (

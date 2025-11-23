@@ -8,12 +8,16 @@ import { celo } from 'viem/chains';
 import { sendTransactionWithDivvi } from '@/lib/divvi';
 import toast from 'react-hot-toast';
 
+// Celo Mainnet cUSD Address for paying gas in MiniPay
+const CUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a";
+
 interface RewardsPanelProps {
   userAddress: string | null;
   isConnected: boolean;
+  isMiniPay?: boolean; // Added prop
 }
 
-export function RewardsPanel({ userAddress, isConnected }: RewardsPanelProps) {
+export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: RewardsPanelProps) {
   const [userScores, setUserScores] = useState<UserScore[]>([]);
   const [claimingRewards, setClaimingRewards] = useState<string[]>([]);
   const [claimedNFTs, setClaimedNFTs] = useState<{ [quizId: string]: boolean }>({});
@@ -24,19 +28,17 @@ export function RewardsPanel({ userAddress, isConnected }: RewardsPanelProps) {
   useEffect(() => {
     const fetchUserScores = async () => {
       if (!isConnected || !userAddress || !contractAddress || !window.ethereum) {
-        setError('Wallet not connected or contract address missing');
+        // Don't show error if just not connected yet
+        if(isConnected) setError('Contract address missing or wallet issue');
         return;
       }
 
       try {
+        // Standard read-only provider is fine for fetching data even in MiniPay
         const provider = new ethers.BrowserProvider(window.ethereum);
-        const network = await provider.getNetwork();
-        if (Number(network.chainId) !== CELO_MAINNET_CHAIN_ID) {
-          setError('Please switch to Celo Mainnet');
-          return;
-        }
-
         const contract = new ethers.Contract(contractAddress, QuizRewardsABI, provider);
+        
+        // Get raw completions
         const completions = await contract.getPlayerQuizCompletions(userAddress);
 
         const quizMap = new Map();
@@ -44,11 +46,18 @@ export function RewardsPanel({ userAddress, isConnected }: RewardsPanelProps) {
           completions.map(async (completion: any) => {
             const quizId = completion.quizId?.toString();
             if (!quizId) return null;
+            
             if (!quizMap.has(quizId)) {
-              const quizResponse = await fetch(`/api/quizzes?id=${quizId}`);
-              const quizData = quizResponse.ok ? await quizResponse.json() : { title: 'Unknown Quiz', questions: [] };
-              quizMap.set(quizId, quizData);
+              // Fetch metadata
+              try {
+                const quizResponse = await fetch(`/api/quizzes?id=${quizId}`);
+                const quizData = quizResponse.ok ? await quizResponse.json() : { title: 'Unknown Quiz', questions: [] };
+                quizMap.set(quizId, quizData);
+              } catch (e) {
+                 quizMap.set(quizId, { title: 'Unknown Quiz', questions: [] });
+              }
             }
+            
             const quizData = quizMap.get(quizId);
             return {
               quizId,
@@ -62,40 +71,40 @@ export function RewardsPanel({ userAddress, isConnected }: RewardsPanelProps) {
         );
 
         const validScores = scores.filter((score): score is UserScore => score !== null);
+        // Sort by most recent
+        validScores.sort((a, b) => b.completedAt.getTime() - a.completedAt.getTime());
         setUserScores(validScores);
         setError(null);
 
-        // Check claimed NFTs
+        // Check claimed status
         const claimed: { [quizId: string]: boolean } = {};
         for (const score of validScores) {
           if (!score.quizId) continue;
-          const hasCompleted = await contract.hasCompletedQuiz(userAddress, score.quizId);
-          claimed[score.quizId] = hasCompleted;
+          // Only check if they actually have a perfect score
+          if (score.score === score.totalQuestions && score.totalQuestions > 0) {
+             const hasCompleted = await contract.hasCompletedQuiz(userAddress, score.quizId);
+             claimed[score.quizId] = hasCompleted;
+          }
         }
         setClaimedNFTs(claimed);
+
       } catch (err: any) {
         console.error('Error fetching user scores:', err);
-        setError(err.message || 'Failed to fetch quiz completions');
-        setUserScores([]);
+        // Silent fail on network mismatch, user will see button to switch later
+        if(!err.message.includes("network")) {
+            setError('Failed to load your history. Please refresh.');
+        }
       }
     };
     fetchUserScores();
   }, [userAddress, isConnected, contractAddress]);
 
-  const totalRewardsEarned = userScores.filter(score => score.score === score.totalQuestions).length;
+  const totalRewardsEarned = Object.values(claimedNFTs).filter(Boolean).length;
   const totalPointsEarned = userScores.reduce((acc, score) => acc + score.score, 0);
 
   const handleClaimReward = async (scoreId: string) => {
     if (!isConnected || !userAddress) {
-      toast.error('Please connect your wallet to claim rewards.');
-      return;
-    }
-    if (!contractAddress) {
-      toast.error('Contract address is not configured.');
-      return;
-    }
-    if (typeof window === 'undefined' || !window.ethereum) {
-      toast.error('No wallet provider detected.');
+      toast.error('Please connect your wallet.');
       return;
     }
 
@@ -103,163 +112,194 @@ export function RewardsPanel({ userAddress, isConnected }: RewardsPanelProps) {
     setError(null);
 
     try {
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const network = await provider.getNetwork();
-      if (Number(network.chainId) !== CELO_MAINNET_CHAIN_ID) {
-        try {
-          await window.ethereum.request({
-            method: 'wallet_switchEthereumChain',
-            params: [{ chainId: `0x${CELO_MAINNET_CHAIN_ID.toString(16)}` }],
-          });
-        } catch (switchError: any) {
-          throw new Error('Please switch to Celo Mainnet');
+      // =========================================================
+      // MINIPAY SPECIFIC LOGIC (Using cUSD for Gas)
+      // =========================================================
+      if (isMiniPay) {
+        const walletClient = createWalletClient({
+          chain: celo,
+          transport: custom(window.ethereum!),
+        });
+
+        console.log('MiniPay Claim: Using cUSD for gas');
+        
+        const hash = await walletClient.writeContract({
+            address: contractAddress as `0x${string}`,
+            abi: QuizRewardsABI,
+            functionName: 'claimNFTReward',
+            account: userAddress as `0x${string}`,
+            args: [BigInt(scoreId)], // Ensure BigInt for ID
+            feeCurrency: CUSD_ADDRESS as `0x${string}`
+        });
+        
+        console.log('MiniPay Tx Hash:', hash);
+
+      } else {
+        // =========================================================
+        // STANDARD BROWSER LOGIC
+        // =========================================================
+        const provider = new ethers.BrowserProvider(window.ethereum!);
+        const network = await provider.getNetwork();
+        
+        if (Number(network.chainId) !== CELO_MAINNET_CHAIN_ID) {
+           try {
+             await window.ethereum!.request({
+               method: 'wallet_switchEthereumChain',
+               params: [{ chainId: `0x${CELO_MAINNET_CHAIN_ID.toString(16)}` }],
+             });
+           } catch (e) {
+             throw new Error('Please switch to Celo Mainnet');
+           }
         }
+
+        const signer = await provider.getSigner();
+        const contract = new ethers.Contract(contractAddress, QuizRewardsABI, signer);
+        const walletClient = createWalletClient({
+            chain: celo,
+            transport: custom(window.ethereum!)
+        });
+
+        await sendTransactionWithDivvi(
+          contract,
+          'claimNFTReward',
+          [scoreId],
+          walletClient,
+          provider
+        );
       }
 
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(contractAddress, QuizRewardsABI, signer);
-      const walletClient = createWalletClient({
-        chain: celo,
-        transport: custom(window.ethereum!),
-      });
-
-      console.log('Claiming NFT for quizId:', scoreId, 'on contract:', contractAddress);
-      await sendTransactionWithDivvi(
-        contract,
-        'claimNFTReward',
-        [scoreId],
-        walletClient,
-        provider
-      );
-      console.log('NFT reward claimed successfully');
-      toast.success('NFT reward claimed successfully! 🎉');
+      toast.success('NFT Claimed Successfully! 🎉');
       setClaimedNFTs(prev => ({ ...prev, [scoreId]: true }));
+
     } catch (err: any) {
-      let errorMessage = 'Failed to claim NFT reward';
-      if (err.code === 'INSUFFICIENT_FUNDS') {
-        errorMessage = 'Insufficient funds for gas fees. Please fund your wallet with CELO.';
-      } else if (err.message.includes('unknown function') || err.message.includes('INVALID_ARGUMENT')) {
-        errorMessage = 'Claim function not found. Please verify the contract address and ABI.';
-      } else if (err.reason) {
-        errorMessage = err.reason;
-      } else if (err.message) {
-        errorMessage = err.message;
-      }
       console.error('Claim error:', err);
-      setError(errorMessage);
-      toast.error(errorMessage);
+      let msg = 'Failed to claim reward';
+      if (err.message.includes('INSUFFICIENT_FUNDS') || err.code === 'INSUFFICIENT_FUNDS') {
+         msg = isMiniPay ? 'Insufficient cUSD for gas.' : 'Insufficient CELO for gas.';
+      }
+      toast.error(msg);
     } finally {
       setClaimingRewards(prev => prev.filter(id => id !== scoreId));
     }
   };
 
   return (
-    <div className="space-y-4 sm:space-y-6 px-4 sm:px-0">
-      <h2 className="text-2xl sm:text-3xl font-bold text-white mb-4 sm:mb-6">🏆 Your Rewards</h2>
-      
+    <div className="space-y-8">      
       {error && (
-        <div className="bg-red-500/20 border border-red-500/50 rounded-lg p-3 sm:p-4 mb-4 sm:mb-6 text-red-400 text-sm sm:text-base">
+        <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-red-300 text-sm text-center">
           {error}
         </div>
       )}
       
       {!isConnected ? (
-        <div className="text-center py-8 sm:py-12">
-          <div className="text-4xl sm:text-6xl mb-3 sm:mb-4" role="img" aria-label="Link emoji">
-            🔗
-          </div>
-          <h3 className="text-lg sm:text-xl font-bold text-white mb-2">Connect Your Wallet</h3>
-          <p className="text-gray-400 mb-4 sm:mb-6 text-sm sm:text-base px-4">
-            Connect your wallet to view and claim your quiz rewards
-          </p>
+        <div className="text-center py-16 bg-slate-800/40 rounded-2xl border border-slate-700/50">
+          <div className="text-6xl mb-4 animate-bounce">🔐</div>
+          <h3 className="text-xl font-bold text-white mb-2">Connect to View Rewards</h3>
+          <p className="text-slate-400">Connect your wallet to see your NFTs and scores.</p>
         </div>
       ) : userScores.length === 0 ? (
-        <div className="text-center py-8 sm:py-12">
-          <div className="text-4xl sm:text-6xl mb-3 sm:mb-4" role="img" aria-label="Gamepad emoji">
-            🎮
-          </div>
-          <h3 className="text-lg sm:text-xl font-bold text-white mb-2">No Quiz Results Yet</h3>
-          <p className="text-gray-400 mb-4 sm:mb-6 text-sm sm:text-base px-4">
-            Complete some quizzes to start earning NFTs!
-          </p>
+        <div className="text-center py-16 bg-slate-800/40 rounded-2xl border border-slate-700/50">
+          <div className="text-6xl mb-4">📝</div>
+          <h3 className="text-xl font-bold text-white mb-2">No Quiz Results Yet</h3>
+          <p className="text-slate-400 mb-6">Prove your knowledge to start earning.</p>
+          <a href="/" className="text-yellow-400 hover:text-yellow-300 font-semibold underline decoration-yellow-400/30 hover:decoration-yellow-300">
+            Take your first quiz
+          </a>
         </div>
       ) : (
         <>
-          {/* Stats Cards */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6 mb-6 sm:mb-8">
-            <div className="bg-gradient-to-br from-yellow-500/20 to-orange-500/20 border border-yellow-500/30 rounded-xl p-4 sm:p-6 text-center">
-              <div className="text-2xl sm:text-3xl font-bold text-yellow-400 mb-1 sm:mb-2">{totalRewardsEarned}</div>
-              <div className="text-white font-semibold text-sm sm:text-base">NFTs Earned</div>
-              <div className="text-xs sm:text-sm text-gray-400">For perfect scores</div>
+          {/* Stats Cards - Blue/Yellow Theme */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            {/* Card 1: NFTs (Yellow/Orange - The "Reward") */}
+            <div className="bg-gradient-to-br from-slate-800 to-slate-900 border border-yellow-500/30 rounded-2xl p-6 text-center shadow-lg shadow-yellow-900/10">
+              <div className="text-4xl font-black text-yellow-400 mb-2">{totalRewardsEarned}</div>
+              <div className="text-slate-200 font-medium uppercase tracking-wider text-xs">NFTs Owned</div>
             </div>
-            <div className="bg-gradient-to-br from-green-500/20 to-emerald-500/20 border border-green-500/30 rounded-xl p-4 sm:p-6 text-center">
-              <div className="text-2xl sm:text-3xl font-bold text-green-400 mb-1 sm:mb-2">{totalPointsEarned}</div>
-              <div className="text-white font-semibold text-sm sm:text-base">Total Points</div>
-              <div className="text-xs sm:text-sm text-gray-400">Across all quizzes</div>
+
+            {/* Card 2: Points (Blue - The "Knowledge") */}
+            <div className="bg-gradient-to-br from-slate-800 to-slate-900 border border-blue-500/30 rounded-2xl p-6 text-center shadow-lg shadow-blue-900/10">
+              <div className="text-4xl font-black text-blue-400 mb-2">{totalPointsEarned}</div>
+              <div className="text-slate-200 font-medium uppercase tracking-wider text-xs">Total Points</div>
             </div>
-            <div className="bg-gradient-to-br from-purple-500/20 to-pink-500/20 border border-purple-500/30 rounded-xl p-4 sm:p-6 text-center sm:col-span-2 lg:col-span-1">
-              <div className="text-2xl sm:text-3xl font-bold text-purple-400 mb-1 sm:mb-2">{userScores.length}</div>
-              <div className="text-white font-semibold text-sm sm:text-base">Quizzes Completed</div>
-              <div className="text-xs sm:text-sm text-gray-400">Keep learning!</div>
+
+            {/* Card 3: Quizzes (Purple/Slate - The "Activity") */}
+            <div className="bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-500/30 rounded-2xl p-6 text-center shadow-lg">
+              <div className="text-4xl font-black text-slate-300 mb-2">{userScores.length}</div>
+              <div className="text-slate-400 font-medium uppercase tracking-wider text-xs">Quizzes Taken</div>
             </div>
           </div>
 
-          {/* Quiz History */}
-          <div className="bg-white/10 rounded-xl p-4 sm:p-6">
-            <h3 className="text-lg sm:text-xl font-bold text-white mb-3 sm:mb-4">📊 Quiz History</h3>
-            <div className="space-y-3 sm:space-y-4">
-              {userScores.map((score) => (
-                <div 
-                  key={score.quizId} 
-                  className="bg-white/10 rounded-lg p-3 sm:p-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 sm:gap-0"
-                >
-                  <div className="flex-1">
-                    <h4 className="font-bold text-white text-sm sm:text-base mb-1">{score.quizTitle}</h4>
-                    <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4 text-xs sm:text-sm text-gray-400">
-                      <p>
-                        Score: {score.score}/{score.totalQuestions} (
-                        {score.totalQuestions > 0 ? Math.round((score.score / score.totalQuestions) * 100) : 0}%)
-                      </p>
-                      <p>Completed: {score.completedAt.toLocaleDateString()}</p>
-                      <p>Attempts: {score.attempts}</p>
+          {/* Quiz History List */}
+          <div className="bg-slate-800/50 backdrop-blur-md rounded-3xl border border-slate-700 overflow-hidden">
+            <div className="p-6 border-b border-slate-700/50 flex justify-between items-center">
+              <h3 className="text-xl font-bold text-white">📜 Activity Log</h3>
+            </div>
+            
+            <div className="divide-y divide-slate-700/50">
+              {userScores.map((score) => {
+                 const isPerfect = score.totalQuestions > 0 && score.score === score.totalQuestions;
+                 const isClaimed = claimedNFTs[score.quizId];
+
+                 return (
+                  <div 
+                    key={`${score.quizId}-${score.completedAt.getTime()}`} 
+                    className="p-4 sm:p-6 hover:bg-slate-700/30 transition-colors flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+                  >
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-1">
+                        <h4 className="font-bold text-white text-lg">{score.quizTitle}</h4>
+                        {isPerfect && <span className="text-xs bg-yellow-500/20 text-yellow-300 px-2 py-0.5 rounded-full border border-yellow-500/30">Perfect Score</span>}
+                      </div>
+                      
+                      <div className="flex flex-wrap gap-y-1 gap-x-4 text-sm text-slate-400">
+                        <span className="flex items-center gap-1">
+                          <span className={isPerfect ? "text-green-400 font-bold" : "text-slate-300"}>
+                            {score.score}/{score.totalQuestions}
+                          </span> Correct
+                        </span>
+                        <span className="w-1 h-1 rounded-full bg-slate-600 self-center"></span>
+                        <span>{score.completedAt.toLocaleDateString()}</span>
+                        <span className="w-1 h-1 rounded-full bg-slate-600 self-center"></span>
+                        <span>{score.attempts} Attempts</span>
+                      </div>
                     </div>
-                  </div>
-                  
-                  {score.quizId && score.score === score.totalQuestions && !claimedNFTs[score.quizId] ? (
-                    <button
-                      onClick={() => handleClaimReward(score.quizId)}
-                      disabled={claimingRewards.includes(score.quizId)}
-                      className="w-full sm:w-auto px-3 sm:px-4 py-2 bg-gradient-to-r from-yellow-400 to-orange-400 hover:from-yellow-500 hover:to-orange-500 text-black disabled:bg-gray-600 disabled:text-gray-400 font-semibold rounded-full transition-all text-sm sm:text-base"
-                      aria-label={`Claim NFT for ${score.quizTitle}`}
-                    >
-                      {claimingRewards.includes(score.quizId) ? (
-                        <div className="flex items-center justify-center sm:justify-start space-x-2">
-                          <div className="animate-spin rounded-full h-3 sm:h-4 w-3 sm:w-4 border-b-2 border-gray-200"></div>
-                          <span>Claiming...</span>
+                    
+                    {/* Action Button Area */}
+                    <div>
+                      {isPerfect && !isClaimed ? (
+                        <button
+                          onClick={() => handleClaimReward(score.quizId)}
+                          disabled={claimingRewards.includes(score.quizId)}
+                          className="w-full sm:w-auto px-6 py-2.5 bg-gradient-to-r from-yellow-400 to-orange-500 hover:from-yellow-300 hover:to-orange-400 text-black font-bold rounded-xl shadow-lg shadow-orange-500/20 transform hover:-translate-y-0.5 transition-all disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none flex items-center justify-center gap-2"
+                        >
+                          {claimingRewards.includes(score.quizId) ? (
+                            <>
+                              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-black"></div>
+                              <span>Minting...</span>
+                            </>
+                          ) : (
+                            <>
+                              <span>🎁 Claim NFT</span>
+                            </>
+                          )}
+                        </button>
+                      ) : isPerfect && isClaimed ? (
+                        <div className="px-4 py-2 bg-green-500/10 border border-green-500/20 rounded-xl text-green-400 text-sm font-semibold flex items-center gap-2 justify-center sm:justify-end">
+                          <span>✅ NFT Minted</span>
                         </div>
                       ) : (
-                        '🎁 Claim NFT'
+                        <div className="text-slate-500 text-sm italic px-2">
+                           Retake for NFT
+                        </div>
                       )}
-                    </button>
-                  ) : score.score === score.totalQuestions && claimedNFTs[score.quizId] ? (
-                    <span className="text-xs sm:text-sm text-green-400 font-semibold text-center sm:text-right">
-                      NFT Claimed
-                    </span>
-                  ) : null}
-                </div>
-              ))}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </>
       )}
-      
-      {/* Info Panel */}
-      <div className="mt-4 sm:mt-6 bg-blue-500/20 border border-blue-500/50 rounded-xl p-3 sm:p-4">
-        <h3 className="text-base sm:text-lg font-bold text-white mb-2 sm:mb-3">ℹ️ Reward System</h3>
-        <p className="text-xs sm:text-sm text-gray-300">
-          Earn an NFT for achieving a perfect score on any quiz, minted on the Celo blockchain!
-        </p>
-      </div>
     </div>
   );
 }

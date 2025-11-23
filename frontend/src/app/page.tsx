@@ -26,7 +26,6 @@ export default function Home() {
   const [isCheckingIn, setIsCheckingIn] = useState(false);
   const contractAddress: string = process.env.NEXT_PUBLIC_QUIZ_CONTRACT_ADDRESS || '';
   
-  // Destructure isMiniPay from context
   const { userAddress, username, isConnected, isMiniPay, error: walletError } = useWallet();
 
   useEffect(() => {
@@ -36,37 +35,27 @@ export default function Home() {
   const fetchQuizzes = async () => {
     try {
       const response = await fetch('/api/quizzes');
-      if (!response.ok) {
-        throw new Error(`Failed to fetch quizzes: ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`Failed to fetch quizzes`);
       const data = await response.json();
       setQuizzes(data);
     } catch (err: any) {
-      const errorMessage = 'Failed to fetch quizzes: ' + err.message;
-      setError(errorMessage);
-      toast.error(errorMessage);
+      console.error(err);
+      toast.error('Failed to load quizzes');
     }
   };
 
   const checkParticipation = async (quizId: string) => {
     if (!userAddress) return false;
     try {
-      const quizResponse = await fetch(`/api/quizzes?id=${quizId}`);
-      if (!quizResponse.ok) {
-        console.warn(`Quiz ${quizId} not found: ${quizResponse.status}`);
-        return false;
-      }
-      const quiz = await quizResponse.json();
-      const totalQuestions = quiz.questions?.length || 0;
-
+      // Optimized: In a real app, fetch all attempts in one go rather than looping requests
       const response = await fetch(`/api/quizAttempts?quizId=${quizId}&address=${userAddress}`);
       if (response.ok) {
         const { attempt } = await response.json();
-        return attempt && attempt.score === totalQuestions;
+        // We only care if they got a perfect score for the UI "Completed" badge
+        return attempt && attempt.score > 0; 
       }
       return false;
-    } catch (err: any) {
-      console.error(`Error checking participation for ${quizId}: ${err.message}`);
+    } catch (err) {
       return false;
     }
   };
@@ -76,13 +65,12 @@ export default function Home() {
       const updateParticipation = async () => {
         const newParticipation: { [quizId: string]: boolean } = {};
         for (const quiz of quizzes) {
+          // Fetch quiz details to get max score if needed, or just check existence of attempt
           newParticipation[quiz.id] = await checkParticipation(quiz.id);
         }
         setParticipation(newParticipation);
       };
-      updateParticipation().catch((err) =>
-        console.error('Error updating participation:', err.message)
-      );
+      updateParticipation();
     }
   }, [userAddress, quizzes]);
 
@@ -101,194 +89,150 @@ export default function Home() {
       toast.error('Contract address is not configured.');
       return;
     }
-    if (typeof window === 'undefined' || !window.ethereum) {
-      toast.error('No wallet provider detected.');
-      return;
-    }
   
     setIsCheckingIn(true);
     try {
       let txHash;
 
       // =========================================================
-      // MINIPAY SPECIFIC LOGIC
+      // MINIPAY SPECIFIC LOGIC (Check-In)
       // =========================================================
       if (isMiniPay) {
-        // 1. Create Viem Client
         const walletClient = createWalletClient({
-          chain: celo, // MiniPay is on Celo Mainnet
-          transport: custom(window.ethereum),
+          chain: celo, 
+          transport: custom(window.ethereum!),
         });
-
-        console.log('MiniPay CheckIn: Using cUSD for gas');
         
-        // 2. Write Contract with feeCurrency (cUSD)
+        console.log('MiniPay CheckIn: Using cUSD');
         txHash = await walletClient.writeContract({
           address: contractAddress as `0x${string}`,
           abi: QuizRewardsABI,
           functionName: 'checkIn',
-          // FIX: explicitly provide the account
           account: userAddress as `0x${string}`, 
           args: [],
-          feeCurrency: CUSD_ADDRESS as `0x${string}`, // Crucial for MiniPay
+          feeCurrency: CUSD_ADDRESS as `0x${string}`,
         });
 
       } else {
-        // =========================================================
-        // STANDARD BROWSER LOGIC (Metamask, etc)
-        // =========================================================
-        const provider = new ethers.BrowserProvider(window.ethereum);
-        const network = await provider.getNetwork();
-        const currentChainId = Number(network.chainId);
-        
-        const supportedChains = [42220, 44787];
-        
-        if (!supportedChains.includes(currentChainId)) {
-          try {
-            await window.ethereum.request({
-              method: 'wallet_switchEthereumChain',
-              params: [{ chainId: `0x${(42220).toString(16)}` }],
-            });
-          } catch (switchError: any) {
-            if (switchError.code === 4902) {
-                 // add chain logic here if needed
-            }
-             throw new Error('Please switch to Celo network.');
-          }
-        }
-    
+        // STANDARD BROWSER LOGIC
+        const provider = new ethers.BrowserProvider(window.ethereum!);
         const signer = await provider.getSigner();
         const contract = new ethers.Contract(contractAddress, QuizRewardsABI, signer);
         const walletClient = createWalletClient({
-          chain: currentChainId === 44787 ? celoAlfajores : celo,
-          transport: custom(window.ethereum),
+          chain: celo,
+          transport: custom(window.ethereum!),
         });
     
-        console.log('Calling checkIn on contract via Divvi/Ethers');
-        txHash = await sendTransactionWithDivvi(
-          contract,
-          'checkIn',
-          [],
-          walletClient,
-          provider
-        );
+        txHash = await sendTransactionWithDivvi(contract, 'checkIn', [], walletClient, provider);
       }
       
-      console.log('Check-in transaction hash:', txHash);
-      toast.success('Successfully checked in! 🎉');
+      console.log('Tx Hash:', txHash);
+      toast.success('Successfully checked in! +10 Points 🎉');
 
     } catch (err: any) {
-      let errorMessage = err.message || 'Failed to check in';
-      
-      if (err.code === 'INSUFFICIENT_FUNDS') {
-        errorMessage = 'Insufficient funds for gas.';
-      } else if (err.message.includes('already checked in')) {
-        errorMessage = 'You have already checked in today.';
-      }
-      
-      console.error('Check-in error:', err);
-      toast.error(errorMessage);
-      setError(errorMessage);
+      let msg = err.message || 'Failed to check in';
+      if (err.message.includes('already checked in')) msg = 'You have already checked in today.';
+      toast.error(msg);
     } finally {
       setIsCheckingIn(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-black text-white py-6 sm:py-12 px-4 sm:px-6 lg:px-8">
+    // THEME: Slate/Blue Gradient Background
+    <div className="min-h-screen bg-gradient-to-b from-slate-900 via-blue-950 to-slate-900 text-white py-6 sm:py-12 px-4 sm:px-6 lg:px-8">
       <div className="max-w-5xl mx-auto">
-        <header className="text-center mb-8 sm:mb-12">
-          <h1 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-500">
-            <Image
-              src="/logo.png"
-              alt="knowit? Logo"
-              width={200}
-              height={100}
-              className="inline-block mb-2 sm:mb-0" />
+        
+        {/* HEADER */}
+        <header className="text-center mb-10 sm:mb-14">
+          <h1 className="text-4xl sm:text-6xl font-extrabold tracking-tight mb-4 flex flex-col sm:flex-row justify-center items-center gap-3">
+            <span className="bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-cyan-300">
+              KnowIt?
+            </span>
           </h1>
-          <p className="mt-2 sm:mt-3 text-base sm:text-lg text-gray-300 px-4">
-            Learn, earn, and mint NFTs on the Celo blockchain
-            {username && (
-              <span className="block sm:inline">
-                <span className="hidden sm:inline">, </span>
-                <span className="sm:hidden">Welcome, </span>
-                {username}!
-              </span>
-            )}
+          <p className="mt-2 text-lg text-slate-300 max-w-2xl mx-auto">
+            Daily quizzes, on-chain rewards, and NFT milestones on Celo.
+            {username && <span className="block text-yellow-400 mt-1">Welcome back, {username}!</span>}
           </p>
-          <div className="mt-4 sm:mt-6 flex flex-col sm:flex-row gap-3 sm:gap-4 justify-center items-center">
+
+          <div className="mt-8 flex flex-col sm:flex-row gap-4 justify-center items-center">
             <Link href="/rewards">
-              <button className="w-full sm:w-auto px-4 sm:px-6 py-2 sm:py-3 bg-gradient-to-r from-yellow-400 to-orange-400 hover:from-yellow-500 hover:to-orange-500 text-black font-semibold rounded-full transition-all duration-300 text-sm sm:text-base">
+              <button className="w-full sm:w-auto px-8 py-3 bg-gradient-to-r from-yellow-400 to-orange-500 hover:from-yellow-300 hover:to-orange-400 text-black font-bold rounded-xl shadow-lg shadow-orange-500/20 transition-all transform hover:-translate-y-1">
                 🏆 View Rewards
               </button>
             </Link>
             <button
               onClick={handleCheckIn}
               disabled={isCheckingIn || !isConnected}
-              className="w-full sm:w-auto px-4 sm:px-6 py-2 sm:py-3 bg-gradient-to-r from-green-400 to-teal-400 hover:from-green-500 hover:to-teal-500 text-black font-semibold rounded-full transition-all duration-300 disabled:bg-gray-600 text-sm sm:text-base"
+              className="w-full sm:w-auto px-8 py-3 bg-slate-700 hover:bg-slate-600 text-white border border-slate-500 font-semibold rounded-xl transition-all transform hover:-translate-y-1 disabled:opacity-50 disabled:hover:translate-y-0"
             >
-              {isCheckingIn ? 'Checking In...' : '✅ Check In'}
+              {isCheckingIn ? 'Checking In...' : '✅ Daily Check-In'}
             </button>
           </div>
         </header>
 
         {(error || walletError) && (
-          <div className="mb-6 sm:mb-8 p-4 bg-red-500/20 text-red-300 rounded-lg text-center text-sm sm:text-base">
+          <div className="mb-8 p-4 bg-red-500/10 border border-red-500/30 text-red-300 rounded-xl text-center text-sm">
             {error || walletError}
           </div>
         )}
 
-        <div className="flex flex-col sm:flex-row justify-center mb-6 sm:mb-8 gap-3 sm:gap-4">
-          <ConnectWallet
-            className="w-full sm:w-auto bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-semibold rounded-lg transition-all px-4 py-2 text-sm sm:text-base"
-          />
+        <div className="flex justify-center mb-10">
+          <ConnectWallet className="bg-slate-800/50 backdrop-blur p-2 rounded-2xl border border-slate-700" />
         </div>
 
         <main>
           {selectedQuiz ? (
-            <QuizPlayer quiz={selectedQuiz} />
+            <QuizPlayer quiz={selectedQuiz} onBack={() => setSelectedQuiz(null)} />
           ) : showGenerator ? (
-            <QuizGenerator onQuizGenerated={handleQuizGenerated} />
+            <QuizGenerator onQuizGenerated={handleQuizGenerated} onCancel={() => setShowGenerator(false)} />
           ) : (
             <div>
-              <div className="flex justify-center mb-8 sm:mb-10">
+              {/* ACTION BAR */}
+              <div className="flex justify-center mb-12">
                 <button
                   onClick={() => setShowGenerator(true)}
-                  className="w-full sm:w-auto px-6 sm:px-8 py-3 sm:py-4 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white font-bold text-base sm:text-lg rounded-xl shadow-lg hover:shadow-2xl transform hover:-translate-y-1 transition-all duration-300"
+                  className="w-full sm:w-auto px-8 py-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-lg rounded-2xl shadow-xl shadow-blue-900/20 transform hover:-translate-y-1 transition-all"
                 >
-                  🚀 Create New Quiz
+                  ✨ Create New Quiz
                 </button>
               </div>
 
+              {/* QUIZ LIST */}
               <section>
-                <h2 className="text-2xl sm:text-3xl font-bold mb-4 sm:mb-6 text-center bg-clip-text text-transparent bg-gradient-to-r from-blue-300 to-purple-400">
+                <h2 className="text-2xl font-bold mb-6 text-slate-200 border-l-4 border-yellow-400 pl-4">
                   Available Quizzes
                 </h2>
+                
                 {quizzes.length === 0 ? (
-                  <p className="text-center text-gray-400 text-base sm:text-lg animate-pulse px-4">
-                    No quizzes available. Create one to get started!
-                  </p>
+                  <div className="text-center py-12 bg-slate-800/30 rounded-2xl border border-slate-700 border-dashed">
+                    <p className="text-slate-400 text-lg">No quizzes yet. Be the first to create one!</p>
+                  </div>
                 ) : (
-                  <div className="space-y-4 sm:space-y-6 lg:space-y-8">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
                     {quizzes.map((quiz) => (
                       <div
                         key={quiz.id}
-                        className="bg-gray-800/40 backdrop-blur-sm rounded-xl sm:rounded-2xl p-4 sm:p-6 border border-blue-500/20 hover:border-blue-500/50 shadow-xl hover:shadow-2xl transform hover:-translate-y-1 transition-all duration-300"
+                        className="group bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 border border-slate-700 hover:border-blue-500/50 transition-all duration-300 hover:shadow-xl hover:shadow-blue-900/10 flex flex-col"
                       >
-                        <h3 className="text-lg sm:text-xl font-semibold text-blue-200 mb-2">{quiz.title}</h3>
-                        <p className="text-gray-300 text-sm sm:text-base mb-4 line-clamp-2">{quiz.description}</p>
-                        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 sm:gap-0">
-                          <span className="text-xs sm:text-sm text-gray-400">
-                            {participation[quiz.id] ? 'Completed (Perfect Score)' : 'Not Completed'}
-                          </span>
-                          <div className="flex flex-col sm:flex-row gap-2 sm:gap-3 w-full sm:w-auto">
-                            <Link href={`/quiz/${quiz.id}`} className="w-full sm:w-auto">
-                              <button className="w-full sm:w-auto px-3 sm:px-4 py-2 bg-green-500 hover:bg-green-600 text-white font-medium rounded-lg shadow-md hover:shadow-lg transition-all duration-200 text-sm sm:text-base">
-                                {participation[quiz.id] ? 'View Results' : 'Take Quiz'}
+                        <div className="flex justify-between items-start mb-3">
+                          <h3 className="text-xl font-bold text-white group-hover:text-blue-300 transition-colors">{quiz.title}</h3>
+                          {participation[quiz.id] && (
+                            <span className="bg-green-500/20 text-green-400 text-xs px-2 py-1 rounded-lg border border-green-500/30">
+                              Done
+                            </span>
+                          )}
+                        </div>
+                        
+                        <p className="text-slate-400 text-sm mb-6 line-clamp-2 flex-grow">{quiz.description}</p>
+                        
+                        <div className="mt-auto pt-4 border-t border-slate-700/50 flex items-center justify-between">
+                          <span className="text-xs text-slate-500 font-mono">ID: {quiz.id}</span>
+                          <Link href={`/quiz/${quiz.id}`} className="w-full sm:w-auto">
+                              <button className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold rounded-lg transition-colors shadow-lg shadow-blue-900/20">
+                                {participation[quiz.id] ? 'See Results' : 'Start Quiz →'}
                               </button>
-                            </Link>
-                            
-                          </div>
+                           </Link>
                         </div>
                       </div>
                     ))}

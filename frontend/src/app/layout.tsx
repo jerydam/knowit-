@@ -1,39 +1,35 @@
-'use client';
 import './globals.css';
-import { WalletProvider } from '@/components/context/WalletContext';
-import { WagmiProvider, createConfig, http } from 'wagmi';
-import { celo } from 'wagmi/chains';
-import { injected } from 'wagmi/connectors';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { ReactNode, useMemo } from 'react';
+import type { Metadata, Viewport } from "next";
+import { Providers } from "@/components/Providers"; // Import the new component
+import { ReactNode } from 'react';
 
-const queryClient = new QueryClient();
+// --- CRITICAL FOR MINIPAY DETECTION ---
+export const metadata: Metadata = {
+  title: "KnowIt? - Learn & Earn on Celo",
+  description: "Take quizzes, earn rewards, and mint NFTs on the Celo blockchain.",
+  manifest: "/manifest.json", 
+};
+
+// --- CRITICAL FOR MOBILE UI SCALING ---
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+  themeColor: "#0f172a",
+};
 
 export default function RootLayout({ children }: { children: ReactNode }) {
-  const wagmiConfig = useMemo(
-    () =>
-      createConfig({
-        chains: [celo],
-        connectors: [injected()],
-        transports: {
-          [celo.id]: http(),
-        },
-        storage: null,
-      }),
-    []
-  );
-
   return (
     <html lang="en">
       <head>
-        <link rel="shortcut icon" href="favicon.png" type="image/x-icon" />
+        <link rel="shortcut icon" href="/favicon.ico" />
       </head>
-      <body>
-        <QueryClientProvider client={queryClient}>
-          <WagmiProvider config={wagmiConfig}>
-            <WalletProvider>{children}</WalletProvider>
-          </WagmiProvider>
-        </QueryClientProvider>
+      <body className="bg-slate-900 text-white antialiased">
+        {/* Wrap children in the Client Component we created */}
+        <Providers>
+          {children}
+        </Providers>
       </body>
     </html>
   );
