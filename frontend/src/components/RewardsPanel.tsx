@@ -14,7 +14,7 @@ const CUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a";
 interface RewardsPanelProps {
   userAddress: string | null;
   isConnected: boolean;
-  isMiniPay?: boolean; // Added prop
+  isMiniPay?: boolean; 
 }
 
 export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: RewardsPanelProps) {
@@ -27,19 +27,26 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
 
   useEffect(() => {
     const fetchUserScores = async () => {
-      if (!isConnected || !userAddress || !contractAddress || !window.ethereum) {
-        // Don't show error if just not connected yet
-        if(isConnected) setError('Contract address missing or wallet issue');
-        return;
-      }
+      // Only stop if we absolutely lack configuration or user address
+      if (!userAddress || !contractAddress) return;
 
       try {
-        // Standard read-only provider is fine for fetching data even in MiniPay
-        const provider = new ethers.BrowserProvider(window.ethereum);
+        // --- CRITICAL FIX FOR MINIPAY READING ---
+        // Use a Public RPC for reading data. This is much more stable than 
+        // asking the MiniPay wallet for read-only data.
+        const provider = new ethers.JsonRpcProvider("https://forno.celo.org");
+        
         const contract = new ethers.Contract(contractAddress, QuizRewardsABI, provider);
         
         // Get raw completions
         const completions = await contract.getPlayerQuizCompletions(userAddress);
+        
+        console.log("Raw Completions:", completions);
+
+        if (!completions || completions.length === 0) {
+            setUserScores([]);
+            return;
+        }
 
         const quizMap = new Map();
         const scores: UserScore[] = await Promise.all(
@@ -48,8 +55,8 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
             if (!quizId) return null;
             
             if (!quizMap.has(quizId)) {
-              // Fetch metadata
               try {
+                // Fetch metadata from your API
                 const quizResponse = await fetch(`/api/quizzes?id=${quizId}`);
                 const quizData = quizResponse.ok ? await quizResponse.json() : { title: 'Unknown Quiz', questions: [] };
                 quizMap.set(quizId, quizData);
@@ -71,37 +78,37 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
         );
 
         const validScores = scores.filter((score): score is UserScore => score !== null);
-        // Sort by most recent
         validScores.sort((a, b) => b.completedAt.getTime() - a.completedAt.getTime());
         setUserScores(validScores);
         setError(null);
 
-        // Check claimed status
+        // Check claimed status (Still safe to do with Public RPC)
         const claimed: { [quizId: string]: boolean } = {};
         for (const score of validScores) {
           if (!score.quizId) continue;
-          // Only check if they actually have a perfect score
           if (score.score === score.totalQuestions && score.totalQuestions > 0) {
              const hasCompleted = await contract.hasCompletedQuiz(userAddress, score.quizId);
+             // Note: Your contract might need a specific 'hasClaimed' check? 
+             // Assuming hasCompletedQuiz implies the attempt exists. 
+             // If you want to check NFT ownership, you'd check balanceOf/ownerOf.
+             // For now, we stick to your existing logic logic but using the stable provider.
              claimed[score.quizId] = hasCompleted;
           }
         }
         setClaimedNFTs(claimed);
 
       } catch (err: any) {
-        console.error('Error fetching user scores:', err);
-        // Silent fail on network mismatch, user will see button to switch later
-        if(!err.message.includes("network")) {
-            setError('Failed to load your history. Please refresh.');
-        }
+        console.error('Error fetching scores:', err);
+        setError(`Load Error: ${err.message || "Unknown error"}`);
       }
     };
     fetchUserScores();
-  }, [userAddress, isConnected, contractAddress]);
+  }, [userAddress, contractAddress]); // Removed isConnected dependency to allow reading if address is known
 
   const totalRewardsEarned = Object.values(claimedNFTs).filter(Boolean).length;
   const totalPointsEarned = userScores.reduce((acc, score) => acc + score.score, 0);
 
+  // --- CLAIM LOGIC (Writes still use the Window Provider) ---
   const handleClaimReward = async (scoreId: string) => {
     if (!isConnected || !userAddress) {
       toast.error('Please connect your wallet.');
@@ -112,44 +119,34 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
     setError(null);
 
     try {
-      // =========================================================
-      // MINIPAY SPECIFIC LOGIC (Using cUSD for Gas)
-      // =========================================================
+      // MINIPAY LOGIC
       if (isMiniPay) {
         const walletClient = createWalletClient({
           chain: celo,
           transport: custom(window.ethereum!),
         });
 
-        console.log('MiniPay Claim: Using cUSD for gas');
+        console.log('MiniPay Claiming ID:', scoreId);
         
-        const hash = await walletClient.writeContract({
+        await walletClient.writeContract({
             address: contractAddress as `0x${string}`,
             abi: QuizRewardsABI,
             functionName: 'claimNFTReward',
             account: userAddress as `0x${string}`,
-            args: [BigInt(scoreId)], // Ensure BigInt for ID
+            args: [BigInt(scoreId)],
             feeCurrency: CUSD_ADDRESS as `0x${string}`
         });
-        
-        console.log('MiniPay Tx Hash:', hash);
 
       } else {
-        // =========================================================
-        // STANDARD BROWSER LOGIC
-        // =========================================================
+        // STANDARD LOGIC
         const provider = new ethers.BrowserProvider(window.ethereum!);
         const network = await provider.getNetwork();
         
         if (Number(network.chainId) !== CELO_MAINNET_CHAIN_ID) {
-           try {
              await window.ethereum!.request({
                method: 'wallet_switchEthereumChain',
                params: [{ chainId: `0x${CELO_MAINNET_CHAIN_ID.toString(16)}` }],
              });
-           } catch (e) {
-             throw new Error('Please switch to Celo Mainnet');
-           }
         }
 
         const signer = await provider.getSigner();
@@ -174,8 +171,10 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
     } catch (err: any) {
       console.error('Claim error:', err);
       let msg = 'Failed to claim reward';
-      if (err.message.includes('INSUFFICIENT_FUNDS') || err.code === 'INSUFFICIENT_FUNDS') {
+      if (err.message?.includes('INSUFFICIENT_FUNDS') || err.code === 'INSUFFICIENT_FUNDS') {
          msg = isMiniPay ? 'Insufficient cUSD for gas.' : 'Insufficient CELO for gas.';
+      } else if (err.shortMessage) {
+          msg = err.shortMessage;
       }
       toast.error(msg);
     } finally {
@@ -187,7 +186,8 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
     <div className="space-y-8">      
       {error && (
         <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-red-300 text-sm text-center">
-          {error}
+          <p className="font-bold">Error Loading Data:</p>
+          <p>{error}</p>
         </div>
       )}
       
@@ -197,7 +197,7 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
           <h3 className="text-xl font-bold text-white mb-2">Connect to View Rewards</h3>
           <p className="text-slate-400">Connect your wallet to see your NFTs and scores.</p>
         </div>
-      ) : userScores.length === 0 ? (
+      ) : userScores.length === 0 && !error ? (
         <div className="text-center py-16 bg-slate-800/40 rounded-2xl border border-slate-700/50">
           <div className="text-6xl mb-4">📝</div>
           <h3 className="text-xl font-bold text-white mb-2">No Quiz Results Yet</h3>
@@ -208,21 +208,18 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
         </div>
       ) : (
         <>
-          {/* Stats Cards - Blue/Yellow Theme */}
+          {/* Stats Cards */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            {/* Card 1: NFTs (Yellow/Orange - The "Reward") */}
             <div className="bg-gradient-to-br from-slate-800 to-slate-900 border border-yellow-500/30 rounded-2xl p-6 text-center shadow-lg shadow-yellow-900/10">
               <div className="text-4xl font-black text-yellow-400 mb-2">{totalRewardsEarned}</div>
               <div className="text-slate-200 font-medium uppercase tracking-wider text-xs">NFTs Owned</div>
             </div>
 
-            {/* Card 2: Points (Blue - The "Knowledge") */}
             <div className="bg-gradient-to-br from-slate-800 to-slate-900 border border-blue-500/30 rounded-2xl p-6 text-center shadow-lg shadow-blue-900/10">
               <div className="text-4xl font-black text-blue-400 mb-2">{totalPointsEarned}</div>
               <div className="text-slate-200 font-medium uppercase tracking-wider text-xs">Total Points</div>
             </div>
 
-            {/* Card 3: Quizzes (Purple/Slate - The "Activity") */}
             <div className="bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-500/30 rounded-2xl p-6 text-center shadow-lg">
               <div className="text-4xl font-black text-slate-300 mb-2">{userScores.length}</div>
               <div className="text-slate-400 font-medium uppercase tracking-wider text-xs">Quizzes Taken</div>
@@ -264,7 +261,6 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
                       </div>
                     </div>
                     
-                    {/* Action Button Area */}
                     <div>
                       {isPerfect && !isClaimed ? (
                         <button

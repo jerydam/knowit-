@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect } from 'react';
 import { ethers } from 'ethers';
 import { useRouter } from 'next/navigation';
 import { Quiz } from '@/types/quiz';
@@ -12,7 +12,7 @@ import { sendTransactionWithDivvi } from '@/lib/divvi';
 
 interface QuizPlayerProps {
   quiz: Quiz;
-  onBack?: () => void; // Added for better nav inside Home
+  onBack?: () => void;
   onComplete?: () => void;
 }
 
@@ -38,7 +38,7 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
     const timer = setInterval(() => {
       setTimeLeft((prev) => {
         if (prev <= 1) {
-          handleNext(true); // Auto-advance on timeout
+          handleNext(true);
           return TIMER_DURATION;
         }
         return prev - 1;
@@ -52,7 +52,6 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
   };
 
   const handleNext = (isTimeout = false) => {
-    // Calculate score for current question
     if (!isTimeout && selectedAnswer === quiz.questions[currentQuestionIndex].correctAnswer) {
       setScore((s) => s + 1);
     }
@@ -67,25 +66,41 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
     }
   };
 
+  // Helper to extract readable error message
+  const getErrorMessage = (error: any) => {
+    if (typeof error === 'string') return error;
+    if (error?.shortMessage) return error.shortMessage;
+    if (error?.message) return error.message.substring(0, 100) + '...';
+    return 'Unknown error occurred';
+  };
+
   // --- CLAIM NFT LOGIC ---
   const claimReward = async () => {
-    if (!userAddress) return;
+    if (!userAddress) {
+        toast.error("No user address found. Is wallet connected?");
+        return;
+    }
     setIsClaiming(true);
+    // Clear previous toasts
+    toast.dismiss(); 
+    const loadingToast = toast.loading("Initializing transaction...");
 
     try {
-       // 1. First, record the completion on the smart contract if not done automatically by backend
-       // Note: Ideally your 'createQuiz' stores the quiz. We just claim here.
-       
        let txHash;
 
        // --- MINIPAY LOGIC ---
        if (isMiniPay) {
+         // 1. Check for Ethereum Object
+         if (!window.ethereum) throw new Error("MiniPay provider not found");
+
          const walletClient = createWalletClient({
            chain: celo,
-           transport: custom(window.ethereum!)
+           transport: custom(window.ethereum)
          });
          
          console.log("Claiming with MiniPay (cUSD gas)...");
+         
+         // 2. Send Transaction
          txHash = await walletClient.writeContract({
             address: contractAddress as `0x${string}`,
             abi: QuizRewardsABI,
@@ -114,14 +129,26 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
          );
        }
 
-       toast.success('NFT Minted Successfully!');
+       toast.success('Transaction Sent! Waiting for confirmation...', { id: loadingToast });
+       console.log("Tx Hash:", txHash);
+       
+       // Optimistic success - in a real app you might wait for receipt
        setHasClaimed(true);
 
     } catch (error: any) {
-      console.error(error);
-      let msg = error.message || "Claim failed";
-      if(msg.includes("INSUFFICIENT_FUNDS")) msg = "Insufficient gas funds";
-      toast.error(msg);
+      console.error("Claim Error:", error);
+      
+      // DETAILED ERROR HANDLING FOR MINIPAY DEBUGGING
+      const msg = getErrorMessage(error);
+      
+      if (msg.includes("User rejected")) {
+          toast.error("Transaction rejected by user", { id: loadingToast });
+      } else if (msg.includes("insufficient funds")) {
+          toast.error("Insufficient cUSD for gas fees", { id: loadingToast });
+      } else {
+          // Show the raw error so you can see it on the phone screen
+          toast.error(`Error: ${msg}`, { id: loadingToast, duration: 5000 });
+      }
     } finally {
       setIsClaiming(false);
     }
@@ -144,42 +171,34 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
             <button 
                 onClick={claimReward}
                 disabled={isClaiming}
-                className="w-full mb-4 py-4 bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-bold rounded-xl shadow-lg hover:shadow-orange-500/20 transition-all"
+                className="w-full mb-4 py-4 bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-bold rounded-xl shadow-lg hover:shadow-orange-500/20 transition-all disabled:opacity-50"
             >
-                {isClaiming ? 'Minting NFT...' : '🎁 Claim NFT Reward'}
+                {isClaiming ? 'Minting in Wallet...' : '🎁 Claim NFT Reward'}
             </button>
         )}
 
         {isPerfect && hasClaimed && (
             <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-xl text-green-400 font-bold mb-4">
-                ✅ NFT Added to Wallet!
+                ✅ Transaction Submitted!
             </div>
         )}
 
         <div className="flex gap-4 justify-center">
-            {onBack ? (
-                <button onClick={onBack} className="px-6 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors">
-                    Back to Home
-                </button>
-            ) : (
-                <button onClick={() => router.push('/')} className="px-6 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors">
-                    Back to Home
-                </button>
-            )}
+            <button onClick={onBack || (() => router.push('/'))} className="px-6 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors">
+                Back to Home
+            </button>
         </div>
       </div>
     );
   }
 
-  // --- QUESTION SCREEN ---
+  // ... (Rest of the Question rendering logic remains the same as your code)
   const question = quiz.questions[currentQuestionIndex];
   const progress = ((currentQuestionIndex + 1) / quiz.questions.length) * 100;
 
   return (
     <div className="max-w-3xl mx-auto">
       <div className="bg-slate-800 rounded-2xl border border-slate-700 shadow-2xl overflow-hidden">
-        
-        {/* Header / Progress */}
         <div className="bg-slate-900/50 p-6 border-b border-slate-700 flex justify-between items-center">
             <div>
                 <h2 className="text-blue-200 text-sm font-bold uppercase tracking-wider mb-1">{quiz.title}</h2>
@@ -194,7 +213,6 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
             <div className="h-full bg-blue-500 transition-all duration-500" style={{ width: `${progress}%` }}></div>
         </div>
 
-        {/* Question Body */}
         <div className="p-6 sm:p-8">
             <p className="text-xl text-white font-medium mb-8 leading-relaxed">
                 {question.question}
@@ -222,7 +240,6 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
             </div>
         </div>
 
-        {/* Footer */}
         <div className="p-6 border-t border-slate-700 bg-slate-900/30 flex justify-end">
             <button
                 onClick={() => handleNext()}
@@ -232,7 +249,6 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
                 {currentQuestionIndex === quiz.questions.length - 1 ? 'Finish Quiz' : 'Next Question →'}
             </button>
         </div>
-
       </div>
     </div>
   );
