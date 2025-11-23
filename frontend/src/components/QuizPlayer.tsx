@@ -6,7 +6,7 @@ import { Quiz } from '@/types/quiz';
 import { QuizRewardsABI } from '@/lib/QuizAbi';
 import toast from 'react-hot-toast';
 import { useWallet } from '@/components/context/WalletContext';
-import { createWalletClient, custom } from 'viem';
+import { createWalletClient, createPublicClient, custom, http } from 'viem';
 import { celo } from 'viem/chains';
 import { sendTransactionWithDivvi } from '@/lib/divvi';
 
@@ -18,6 +18,7 @@ interface QuizPlayerProps {
 
 const TIMER_DURATION = 15;
 const CUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a";
+const CELO_CHAIN_ID = 42220;
 
 export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps) {
   const router = useRouter();
@@ -29,8 +30,9 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
   const [selectedAnswer, setSelectedAnswer] = useState<string | null>(null);
   const [isFinished, setIsFinished] = useState(false);
   const [timeLeft, setTimeLeft] = useState(TIMER_DURATION);
-  const [isClaiming, setIsClaiming] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [hasClaimed, setHasClaimed] = useState(false);
+  const [statusMessage, setStatusMessage] = useState("");
 
   // Timer Logic
   useEffect(() => {
@@ -66,31 +68,56 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
     }
   };
 
-  // Helper to extract readable error message
-  const getErrorMessage = (error: any) => {
-    if (typeof error === 'string') return error;
-    if (error?.shortMessage) return error.shortMessage;
-    if (error?.message) return error.message.substring(0, 100) + '...';
-    return 'Unknown error occurred';
+  // --- HELPER: SWITCH NETWORK ---
+  const switchNetwork = async () => {
+    if (!window.ethereum) return;
+    try {
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: `0x${CELO_CHAIN_ID.toString(16)}` }],
+      });
+    } catch (switchError: any) {
+      // This error code indicates that the chain has not been added to MetaMask.
+      if (switchError.code === 4902) {
+        try {
+          await window.ethereum.request({
+            method: 'wallet_addEthereumChain',
+            params: [
+              {
+                chainId: `0x${CELO_CHAIN_ID.toString(16)}`,
+                chainName: 'Celo Mainnet',
+                nativeCurrency: {
+                  name: 'CELO',
+                  symbol: 'CELO',
+                  decimals: 18,
+                },
+                rpcUrls: ['https://forno.celo.org'],
+                blockExplorerUrls: ['https://explorer.celo.org'],
+              },
+            ],
+          });
+        } catch (addError) {
+          throw new Error('Failed to add Celo network');
+        }
+      } else {
+        throw switchError;
+      }
+    }
   };
 
-  // --- CLAIM NFT LOGIC ---
+  // --- CLAIM NFT LOGIC (2-STEP PROCESS) ---
   const claimReward = async () => {
     if (!userAddress) {
         toast.error("No user address found. Is wallet connected?");
         return;
     }
-    setIsClaiming(true);
-    // Clear previous toasts
-    toast.dismiss(); 
-    const loadingToast = toast.loading("Initializing transaction...");
-
+    
+    setIsProcessing(true);
+    toast.dismiss();
+    
     try {
-       let txHash;
-
-       // --- MINIPAY LOGIC ---
+       // --- MINIPAY PATH ---
        if (isMiniPay) {
-         // 1. Check for Ethereum Object
          if (!window.ethereum) throw new Error("MiniPay provider not found");
 
          const walletClient = createWalletClient({
@@ -98,63 +125,115 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
            transport: custom(window.ethereum)
          });
          
-         console.log("Claiming with MiniPay (cUSD gas)...");
+         const publicClient = createPublicClient({
+            chain: celo,
+            transport: http() 
+         });
+
+         // STEP 1: RECORD SCORE
+         setStatusMessage("Step 1/2: Recording Score...");
+         const recordPromise = toast.loading("Step 1: Recording Score on Blockchain...");
          
-         // 2. Send Transaction
-         txHash = await walletClient.writeContract({
+         const recordHash = await walletClient.writeContract({
+            address: contractAddress as `0x${string}`,
+            abi: QuizRewardsABI,
+            functionName: 'recordQuizCompletion',
+            account: userAddress as `0x${string}`,
+            args: [quiz.id, BigInt(score), BigInt(1)], 
+            feeCurrency: CUSD_ADDRESS as `0x${string}`
+         });
+         
+         await publicClient.waitForTransactionReceipt({ hash: recordHash });
+         toast.success("Score Recorded!", { id: recordPromise });
+
+         // STEP 2: CLAIM NFT
+         setStatusMessage("Step 2/2: Minting NFT...");
+         const claimPromise = toast.loading("Step 2: Minting Reward...");
+         
+         const claimHash = await walletClient.writeContract({
             address: contractAddress as `0x${string}`,
             abi: QuizRewardsABI,
             functionName: 'claimNFTReward',
             account: userAddress as `0x${string}`,
-            args: [BigInt(quiz.id)],
+            args: [quiz.id],
             feeCurrency: CUSD_ADDRESS as `0x${string}`
          });
+
+         await publicClient.waitForTransactionReceipt({ hash: claimHash });
+         toast.success("NFT Minted Successfully!", { id: claimPromise });
        } 
-       // --- STANDARD LOGIC ---
+       
+       // --- STANDARD BROWSER PATH (MetaMask, etc) ---
        else {
-         const provider = new ethers.BrowserProvider(window.ethereum!);
+         if (!window.ethereum) throw new Error("Wallet not found");
+
+         // 1. FORCE NETWORK SWITCH BEFORE ANYTHING ELSE
+         await switchNetwork();
+
+         const provider = new ethers.BrowserProvider(window.ethereum);
          const signer = await provider.getSigner();
          const contract = new ethers.Contract(contractAddress, QuizRewardsABI, signer);
          const walletClient = createWalletClient({
             chain: celo,
-            transport: custom(window.ethereum!)
+            transport: custom(window.ethereum)
          });
 
-         txHash = await sendTransactionWithDivvi(
+         // STEP 1: RECORD SCORE
+         setStatusMessage("Step 1/2: Recording Score...");
+         toast.loading("Step 1: Recording Score...");
+         
+         await sendTransactionWithDivvi(
+            contract,
+            'recordQuizCompletion',
+            [quiz.id, score, 1],
+            walletClient,
+            provider
+         );
+         
+         toast.dismiss();
+         toast.success("Score Recorded!");
+
+         // STEP 2: CLAIM NFT
+         setStatusMessage("Step 2/2: Minting NFT...");
+         toast.loading("Step 2: Minting Reward...");
+
+         await sendTransactionWithDivvi(
             contract,
             'claimNFTReward',
             [quiz.id],
             walletClient,
             provider
          );
+         
+         toast.dismiss();
+         toast.success("NFT Minted!");
        }
 
-       toast.success('Transaction Sent! Waiting for confirmation...', { id: loadingToast });
-       console.log("Tx Hash:", txHash);
-       
-       // Optimistic success - in a real app you might wait for receipt
        setHasClaimed(true);
+       setStatusMessage("");
 
     } catch (error: any) {
       console.error("Claim Error:", error);
-      
-      // DETAILED ERROR HANDLING FOR MINIPAY DEBUGGING
-      const msg = getErrorMessage(error);
+      let msg = error.message || "Transaction failed";
       
       if (msg.includes("User rejected")) {
-          toast.error("Transaction rejected by user", { id: loadingToast });
+          msg = "Transaction rejected by user";
       } else if (msg.includes("insufficient funds")) {
-          toast.error("Insufficient cUSD for gas fees", { id: loadingToast });
-      } else {
-          // Show the raw error so you can see it on the phone screen
-          toast.error(`Error: ${msg}`, { id: loadingToast, duration: 5000 });
+          msg = "Insufficient funds for gas";
+      } else if (msg.includes("Quiz not completed")) {
+          msg = "Score recording failed. Please try again.";
+      } else if (msg.includes("Chain ID")) {
+          msg = "Wrong Network. Please switch to Celo.";
       }
+      
+      toast.dismiss();
+      toast.error(msg);
     } finally {
-      setIsClaiming(false);
+      setIsProcessing(false);
+      setStatusMessage("");
     }
   };
 
-  // --- RESULT SCREEN ---
   if (isFinished) {
     const isPerfect = score === quiz.questions.length;
     return (
@@ -167,24 +246,31 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
             You scored <span className="text-blue-400 font-bold">{score}</span> out of <span className="text-white">{quiz.questions.length}</span>
         </p>
 
+        {isProcessing && (
+            <div className="mb-4 p-3 bg-blue-500/20 border border-blue-500/50 rounded-xl text-blue-200 animate-pulse">
+                <p className="font-bold">{statusMessage}</p>
+                <p className="text-xs mt-1">Please confirm transactions in your wallet</p>
+            </div>
+        )}
+
         {isPerfect && !hasClaimed && (
             <button 
                 onClick={claimReward}
-                disabled={isClaiming}
-                className="w-full mb-4 py-4 bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-bold rounded-xl shadow-lg hover:shadow-orange-500/20 transition-all disabled:opacity-50"
+                disabled={isProcessing}
+                className="w-full mb-4 py-4 bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-bold rounded-xl shadow-lg hover:shadow-orange-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
-                {isClaiming ? 'Minting in Wallet...' : '🎁 Claim NFT Reward'}
+                {isProcessing ? 'Processing Transactions...' : '🎁 Claim NFT Reward'}
             </button>
         )}
 
         {isPerfect && hasClaimed && (
             <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-xl text-green-400 font-bold mb-4">
-                ✅ Transaction Submitted!
+                ✅ NFT Added to Wallet!
             </div>
         )}
 
         <div className="flex gap-4 justify-center">
-            <button onClick={onBack || (() => router.push('/'))} className="px-6 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors">
+            <button onClick={onBack || (() => router.push('/'))} disabled={isProcessing} className="px-6 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors disabled:opacity-50">
                 Back to Home
             </button>
         </div>
@@ -192,7 +278,6 @@ export default function QuizPlayer({ quiz, onBack, onComplete }: QuizPlayerProps
     );
   }
 
-  // ... (Rest of the Question rendering logic remains the same as your code)
   const question = quiz.questions[currentQuestionIndex];
   const progress = ((currentQuestionIndex + 1) / quiz.questions.length) * 100;
 

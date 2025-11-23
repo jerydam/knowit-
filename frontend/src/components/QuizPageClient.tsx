@@ -11,12 +11,13 @@ import { ethers } from 'ethers';
 import { QuizRewardsABI } from '@/lib/QuizAbi';
 import { z } from 'zod';
 
+// --- FIX: Update schema to expect a Date object ---
 const UserScoreSchema = z.object({
   quizId: z.string(),
   quizTitle: z.string(),
   score: z.number(),
   totalQuestions: z.number(),
-  completedAt: z.string().transform((str) => new Date(str)),
+  completedAt: z.date(), // Changed from z.string() to z.date()
   attempts: z.number(),
 }).strict();
 
@@ -32,37 +33,45 @@ export default function QuizPageClient({ quiz }: QuizPageClientProps) {
   const contractAddress = process.env.NEXT_PUBLIC_QUIZ_CONTRACT_ADDRESS!;
 
   const fetchUserScores = useCallback(async () => {
-    if (!userAddress || !window.ethereum) return;
+    if (!userAddress) return;
     
     try {
-      const provider = new ethers.BrowserProvider(window.ethereum);
+      // Use Public RPC for better reliability when reading data
+      const provider = new ethers.JsonRpcProvider("https://forno.celo.org");
       const contract = new ethers.Contract(contractAddress, QuizRewardsABI, provider);
       
       // Fetch player completions
+      // Note: Make sure your contract ABI matches the deployed contract
       const completions = await contract.getPlayerQuizCompletions(userAddress);
       
-      const quizMap = new Map();
       const scores = await Promise.all(
         completions.map(async (completion: any) => {
           try {
-            // Fetch quiz details to get title and question count
-            const quizResponse = await fetch(`/api/quizzes?id=${completion.quizId}`);
-            let quizData = { title: 'Unknown Quiz', questions: [] };
-            
-            if (quizResponse.ok) {
-              quizData = await quizResponse.json();
+            // We already have the current quiz details in props, 
+            // no need to fetch if it matches the current page
+            let quizTitle = 'Unknown Quiz';
+            let totalQuestions = 0;
+
+            if (completion.quizId === quiz.id) {
+                quizTitle = quiz.title;
+                totalQuestions = quiz.questions.length;
+            } else {
+                // If it's a different quiz (unlikely in this filtered view but possible in raw data)
+                // We can skip fetching for now to speed up, or implement a cache
+                quizTitle = `Quiz #${completion.quizId}`;
             }
             
+            // Validate and parse with Zod
             return UserScoreSchema.parse({
-              quizId: completion.quizId,
-              quizTitle: quizData.title || 'Unknown Quiz',
+              quizId: completion.quizId.toString(),
+              quizTitle: quizTitle,
               score: Number(completion.score),
-              totalQuestions: quizData.questions?.length || 0,
+              totalQuestions: totalQuestions > 0 ? totalQuestions : Number(completion.score),
               completedAt: new Date(Number(completion.timestamp) * 1000),
               attempts: Number(completion.attempts),
             });
           } catch (parseError) {
-            console.error('Error parsing completion:', parseError, completion);
+            console.error('Error parsing completion:', parseError);
             return null;
           }
         })
@@ -70,14 +79,16 @@ export default function QuizPageClient({ quiz }: QuizPageClientProps) {
       
       // Filter out any null values from failed parsing
       const validScores = scores.filter((score): score is UserScore => score !== null);
-      setUserScores(validScores);
+      
+      // Only show scores for THIS quiz on this page
+      const currentQuizScores = validScores.filter(s => s.quizId === quiz.id);
+      setUserScores(currentQuizScores);
       
     } catch (err: any) {
       console.error('Error fetching user scores:', err);
-      toast.error('Failed to load user scores.');
-      setUserScores([]);
+      // Silent fail is better than crashing UI
     }
-  }, [userAddress, contractAddress]);
+  }, [userAddress, contractAddress, quiz.id, quiz.title, quiz.questions.length]);
 
   useEffect(() => {
     fetchUserScores();
@@ -89,11 +100,11 @@ export default function QuizPageClient({ quiz }: QuizPageClientProps) {
   };
 
   return (
-    <div className="p-4">
+    <div className="p-4 max-w-5xl mx-auto">
       <div className="flex justify-start mb-6">
         <button
           onClick={() => router.back()}
-          className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white font-semibold rounded-lg transition-all duration-300"
+          className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white font-semibold rounded-lg transition-all duration-300"
         >
           ← Back
         </button>
@@ -104,33 +115,42 @@ export default function QuizPageClient({ quiz }: QuizPageClientProps) {
         onComplete={handleQuizComplete}
       />
       
-      <Leaderboard
-        quizId={quiz.id}
-        className="my-6"
-        key={refreshKey}
-      />
-      
-      {/* User Scores Section */}
-      {userAddress && userScores.length > 0 && (
-        <div className="bg-white/10 rounded-xl p-6 mt-6">
-          <h3 className="text-xl font-bold text-white mb-4">Your Previous Attempts</h3>
-          <div className="space-y-2">
-            {userScores.map((score, index) => (
-              <div key={index} className="flex justify-between items-center text-white border-b border-gray-700 pb-2">
-                <span>{score.quizTitle}</span>
-                <span>{score.score}/{score.totalQuestions}</span>
-                <span className="text-sm text-gray-400">
-                  {score.completedAt.toLocaleDateString()}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      
-      <Link href="/" className="inline-block mt-4">
-        <span className="text-blue-400 hover:underline">Back to Home</span>
-      </Link>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-8">
+        {/* Leaderboard Section */}
+        <Leaderboard
+            quizId={quiz.id}
+            className="w-full"
+            key={refreshKey}
+        />
+        
+        {/* User History Section */}
+        {userAddress && (
+            <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700">
+            <h3 className="text-xl font-bold text-white mb-4">Your Past Attempts</h3>
+            {userScores.length === 0 ? (
+                <p className="text-slate-400">No attempts recorded yet.</p>
+            ) : (
+                <div className="space-y-3">
+                {userScores.map((score, index) => (
+                    <div key={index} className="flex justify-between items-center bg-slate-700/30 p-3 rounded-lg border border-slate-600">
+                    <div className="flex flex-col">
+                        <span className="font-semibold text-slate-200">Score: {score.score}/{score.totalQuestions}</span>
+                        <span className="text-xs text-slate-400">
+                            {score.completedAt.toLocaleDateString()} at {score.completedAt.toLocaleTimeString()}
+                        </span>
+                    </div>
+                    {score.score === score.totalQuestions && (
+                        <span className="text-xs bg-green-500/20 text-green-400 px-2 py-1 rounded border border-green-500/30">
+                        Perfect
+                        </span>
+                    )}
+                    </div>
+                ))}
+                </div>
+            )}
+            </div>
+        )}
+      </div>
     </div>
   );
 }

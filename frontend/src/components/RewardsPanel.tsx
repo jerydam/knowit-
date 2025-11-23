@@ -8,7 +8,6 @@ import { celo } from 'viem/chains';
 import { sendTransactionWithDivvi } from '@/lib/divvi';
 import toast from 'react-hot-toast';
 
-// Celo Mainnet cUSD Address for paying gas in MiniPay
 const CUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a";
 
 interface RewardsPanelProps {
@@ -27,22 +26,16 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
 
   useEffect(() => {
     const fetchUserScores = async () => {
-      // Only stop if we absolutely lack configuration or user address
       if (!userAddress || !contractAddress) return;
 
       try {
-        // --- CRITICAL FIX FOR MINIPAY READING ---
-        // Use a Public RPC for reading data. This is much more stable than 
-        // asking the MiniPay wallet for read-only data.
+        // Use Public RPC for reliable reading
         const provider = new ethers.JsonRpcProvider("https://forno.celo.org");
-        
         const contract = new ethers.Contract(contractAddress, QuizRewardsABI, provider);
         
         // Get raw completions
         const completions = await contract.getPlayerQuizCompletions(userAddress);
         
-        console.log("Raw Completions:", completions);
-
         if (!completions || completions.length === 0) {
             setUserScores([]);
             return;
@@ -54,23 +47,33 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
             const quizId = completion.quizId?.toString();
             if (!quizId) return null;
             
+            // Fetch metadata only if not already cached
             if (!quizMap.has(quizId)) {
               try {
-                // Fetch metadata from your API
                 const quizResponse = await fetch(`/api/quizzes?id=${quizId}`);
-                const quizData = quizResponse.ok ? await quizResponse.json() : { title: 'Unknown Quiz', questions: [] };
-                quizMap.set(quizId, quizData);
+                if (quizResponse.ok) {
+                   const quizData = await quizResponse.json();
+                   quizMap.set(quizId, quizData);
+                } else {
+                   // Fallback if API fails: Use ID as title
+                   console.warn(`Quiz API missing for ID: ${quizId}`);
+                   quizMap.set(quizId, { title: `Quiz #${quizId}`, questions: [] }); 
+                }
               } catch (e) {
-                 quizMap.set(quizId, { title: 'Unknown Quiz', questions: [] });
+                 quizMap.set(quizId, { title: `Quiz #${quizId} (Offline)`, questions: [] });
               }
             }
             
             const quizData = quizMap.get(quizId);
+            const scoreVal = Number(completion.score);
+            // If questions array is missing, assume totalQuestions = score (to allow displaying the result)
+            const totalQ = quizData.questions?.length || scoreVal; 
+
             return {
               quizId,
-              quizTitle: quizData.title || 'Unknown Quiz',
-              score: Number(completion.score) || 0,
-              totalQuestions: quizData.questions?.length || 0,
+              quizTitle: quizData.title || `Quiz #${quizId}`,
+              score: scoreVal,
+              totalQuestions: totalQ,
               completedAt: new Date(Number(completion.timestamp) * 1000),
               attempts: Number(completion.attempts) || 0,
             };
@@ -82,33 +85,39 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
         setUserScores(validScores);
         setError(null);
 
-        // Check claimed status (Still safe to do with Public RPC)
+        // Check claimed status
         const claimed: { [quizId: string]: boolean } = {};
         for (const score of validScores) {
           if (!score.quizId) continue;
-          if (score.score === score.totalQuestions && score.totalQuestions > 0) {
-             const hasCompleted = await contract.hasCompletedQuiz(userAddress, score.quizId);
-             // Note: Your contract might need a specific 'hasClaimed' check? 
-             // Assuming hasCompletedQuiz implies the attempt exists. 
-             // If you want to check NFT ownership, you'd check balanceOf/ownerOf.
-             // For now, we stick to your existing logic logic but using the stable provider.
-             claimed[score.quizId] = hasCompleted;
+          // Only check claimed status for perfect scores
+          if (score.score >= score.totalQuestions && score.totalQuestions > 0) {
+             try {
+               const hasCompleted = await contract.hasCompletedQuiz(userAddress, score.quizId);
+               // NOTE: Ideally check balanceOf or ownerOf for true NFT ownership, 
+               // but assuming logic implies completion = claimable/claimed context
+               // For this UI, we will assume if they finished it perfectly, they might have claimed it.
+               // To be 100% sure of "Claimed", we usually check if they own the token ID associated with the quiz.
+               // For now, using existing logic:
+               claimed[score.quizId] = hasCompleted; 
+             } catch (e) {
+               console.error("Check claim failed", e);
+             }
           }
         }
         setClaimedNFTs(claimed);
 
       } catch (err: any) {
         console.error('Error fetching scores:', err);
-        setError(`Load Error: ${err.message || "Unknown error"}`);
+        // Don't blocking error on UI, just log
+        // setError(`Could not load history: ${err.message}`);
       }
     };
     fetchUserScores();
-  }, [userAddress, contractAddress]); // Removed isConnected dependency to allow reading if address is known
+  }, [userAddress, contractAddress]);
 
   const totalRewardsEarned = Object.values(claimedNFTs).filter(Boolean).length;
   const totalPointsEarned = userScores.reduce((acc, score) => acc + score.score, 0);
 
-  // --- CLAIM LOGIC (Writes still use the Window Provider) ---
   const handleClaimReward = async (scoreId: string) => {
     if (!isConnected || !userAddress) {
       toast.error('Please connect your wallet.');
@@ -116,9 +125,10 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
     }
 
     setClaimingRewards(prev => [...prev, scoreId]);
-    setError(null);
+    const loadingToast = toast.loading("Processing Transaction...");
 
     try {
+      let txHash;
       // MINIPAY LOGIC
       if (isMiniPay) {
         const walletClient = createWalletClient({
@@ -128,12 +138,12 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
 
         console.log('MiniPay Claiming ID:', scoreId);
         
-        await walletClient.writeContract({
+        txHash = await walletClient.writeContract({
             address: contractAddress as `0x${string}`,
             abi: QuizRewardsABI,
             functionName: 'claimNFTReward',
             account: userAddress as `0x${string}`,
-            args: [BigInt(scoreId)],
+            args: [BigInt(scoreId)], // ID must be passed correctly
             feeCurrency: CUSD_ADDRESS as `0x${string}`
         });
 
@@ -156,7 +166,7 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
             transport: custom(window.ethereum!)
         });
 
-        await sendTransactionWithDivvi(
+        txHash = await sendTransactionWithDivvi(
           contract,
           'claimNFTReward',
           [scoreId],
@@ -165,18 +175,23 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
         );
       }
 
-      toast.success('NFT Claimed Successfully! 🎉');
+      toast.success('NFT Claimed Successfully! 🎉', { id: loadingToast });
       setClaimedNFTs(prev => ({ ...prev, [scoreId]: true }));
+      console.log("Claim Tx:", txHash);
 
     } catch (err: any) {
       console.error('Claim error:', err);
       let msg = 'Failed to claim reward';
+      
       if (err.message?.includes('INSUFFICIENT_FUNDS') || err.code === 'INSUFFICIENT_FUNDS') {
          msg = isMiniPay ? 'Insufficient cUSD for gas.' : 'Insufficient CELO for gas.';
+      } else if (err.message?.includes("User rejected")) {
+         msg = "Transaction rejected.";
       } else if (err.shortMessage) {
-          msg = err.shortMessage;
+         msg = err.shortMessage;
       }
-      toast.error(msg);
+      
+      toast.error(msg, { id: loadingToast });
     } finally {
       setClaimingRewards(prev => prev.filter(id => id !== scoreId));
     }
@@ -186,8 +201,7 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
     <div className="space-y-8">      
       {error && (
         <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-red-300 text-sm text-center">
-          <p className="font-bold">Error Loading Data:</p>
-          <p>{error}</p>
+           <p>{error}</p>
         </div>
       )}
       
@@ -234,7 +248,7 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
             
             <div className="divide-y divide-slate-700/50">
               {userScores.map((score) => {
-                 const isPerfect = score.totalQuestions > 0 && score.score === score.totalQuestions;
+                 const isPerfect = score.score >= score.totalQuestions && score.totalQuestions > 0;
                  const isClaimed = claimedNFTs[score.quizId];
 
                  return (
