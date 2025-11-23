@@ -4,7 +4,7 @@ import sqlite3 from 'sqlite3';
 
 async function initDb() {
   const db = await open({
-    filename: './ChainIQ.db',
+    filename: './knowit?.db',
     driver: sqlite3.Database,
   });
 

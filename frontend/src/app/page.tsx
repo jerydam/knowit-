@@ -201,7 +201,7 @@ export default function Home() {
           <h1 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-500">
             <Image
               src="/logo.png"
-              alt="ChainIQ Logo"
+              alt="knowit? Logo"
               width={200}
               height={100}
               className="inline-block mb-2 sm:mb-0" />
