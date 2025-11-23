@@ -1,0 +1,17 @@
+// .eslintrc.json
+{
+    "extends": [
+      "next/core-web-vitals",
+      "eslint:recommended",
+      "plugin:@typescript-eslint/recommended",
+      "plugin:react/recommended",
+      "plugin:react-hooks/recommended"
+    ],
+    "rules": {
+      "@typescript-eslint/no-explicit-any": "warn", // Downgrade to warning
+      "@typescript-eslint/no-unused-vars": "warn", // Downgrade to warning
+      "react-hooks/exhaustive-deps": "warn", // Downgrade to warning
+      "@next/next/no-html-link-for-pages": "error",
+      "react/no-unescaped-entities": "error"
+    }
+  }
