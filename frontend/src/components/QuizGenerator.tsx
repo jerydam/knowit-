@@ -1,7 +1,7 @@
 'use client';
 import { useState } from 'react';
 import { ethers } from 'ethers';
-import { createWalletClient, custom } from 'viem';
+import { createWalletClient, createPublicClient, custom, http } from 'viem';
 import { celo } from 'viem/chains';
 import { QuizRewardsABI } from '@/lib/QuizAbi';
 import { sendTransactionWithDivvi } from '@/lib/divvi';
@@ -22,7 +22,9 @@ export function QuizGenerator({ onQuizGenerated, onCancel }: QuizGeneratorProps)
   const [questionCount, setQuestionCount] = useState(5);
   const [image, setImage] = useState<File | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [currentStep, setCurrentStep] = useState<'form' | 'generating' | 'storing' | 'blockchain'>('form');
+  
+  // Track the specific step for the UI
+  const [currentStep, setCurrentStep] = useState<'form' | 'ai' | 'ipfs' | 'blockchain'>('form');
   
   const { userAddress, isConnected, isMiniPay } = useWallet();
   const contractAddress = process.env.NEXT_PUBLIC_QUIZ_CONTRACT_ADDRESS;
@@ -49,9 +51,7 @@ export function QuizGenerator({ onQuizGenerated, onCancel }: QuizGeneratorProps)
     }
 
     setIsGenerating(true);
-    setCurrentStep('generating');
-    // Optional: Initial toast
-    toast('Starting Quiz Generation...', { icon: '🚀' });
+    setCurrentStep('ai'); // Step 1 Starts
 
     try {
       // =================================================
@@ -66,10 +66,7 @@ export function QuizGenerator({ onQuizGenerated, onCancel }: QuizGeneratorProps)
       if (!qRes.ok) throw new Error('Failed to generate questions');
       const questions = await qRes.json();
       
-      // NOTIFICATION: Stage 1 Complete
-      toast.success('Stage 1/3 Complete: Questions Generated');
-      
-      setCurrentStep('storing');
+      setCurrentStep('ipfs'); // Step 2 Starts
 
       // =================================================
       // STAGE 2: STORAGE & UPLOAD
@@ -87,10 +84,7 @@ export function QuizGenerator({ onQuizGenerated, onCancel }: QuizGeneratorProps)
       
       const { quiz } = await sRes.json();
 
-      // NOTIFICATION: Stage 2 Complete
-      toast.success('Stage 2/3 Complete: Assets Uploaded');
-
-      setCurrentStep('blockchain');
+      setCurrentStep('blockchain'); // Step 3 Starts
 
       // =================================================
       // STAGE 3: BLOCKCHAIN MINTING
@@ -104,14 +98,25 @@ export function QuizGenerator({ onQuizGenerated, onCancel }: QuizGeneratorProps)
             transport: custom(window.ethereum!)
         });
         
+        const publicClient = createPublicClient({
+            chain: celo,
+            transport: http()
+        });
+        
+        console.log("Sending transaction to MiniPay...");
+        
         txHash = await walletClient.writeContract({
             address: contractAddress as `0x${string}`,
             abi: QuizRewardsABI,
             functionName: 'createQuiz',
             account: userAddress as `0x${string}`,
-            args: [BigInt(quiz.id), quiz.title, quiz.nftMetadata],
+            // IMPORTANT: Ensure ID is BigInt
+            args: [quiz.id, quiz.title, quiz.nftMetadata], 
             feeCurrency: CUSD_ADDRESS as `0x${string}`
         });
+
+        // FIX: Wait for the transaction to actually be mined
+        await publicClient.waitForTransactionReceipt({ hash: txHash });
       } 
       // --- STANDARD LOGIC ---
       else {
@@ -130,7 +135,10 @@ export function QuizGenerator({ onQuizGenerated, onCancel }: QuizGeneratorProps)
             walletClient, 
             provider
         );
+        // Divvi helper waits for receipt internally usually, but good to be sure
       }
+
+      console.log("Quiz created on chain:", txHash);
 
       // 4. Update DB with Hash
       await fetch('/api/updateQuizTransaction', {
@@ -139,36 +147,61 @@ export function QuizGenerator({ onQuizGenerated, onCancel }: QuizGeneratorProps)
         body: JSON.stringify({ quizId: quiz.id, transactionHash: txHash }),
       });
 
-      // NOTIFICATION: Stage 3 Complete (Final)
-      toast.success('Stage 3/3 Complete: Quiz Minted on Celo!');
-      
+      toast.success('Quiz Created Successfully!');
       onQuizGenerated({ ...quiz, transactionHash: txHash });
 
     } catch (error: any) {
       console.error(error);
-      toast.error(error.message || 'Failed to create quiz');
+      let msg = error.message || 'Failed to create quiz';
+      if (msg.includes("User rejected")) msg = "Transaction rejected by user";
+      toast.error(msg);
       setCurrentStep('form');
     } finally {
       setIsGenerating(false);
     }
   };
 
+  // Helper to determine step status for UI
+  const getStepStatus = (stepName: string) => {
+    const order = ['ai', 'ipfs', 'blockchain'];
+    const currentIndex = order.indexOf(currentStep);
+    const stepIndex = order.indexOf(stepName);
+
+    if (currentIndex > stepIndex) return 'completed';
+    if (currentIndex === stepIndex) return 'active';
+    return 'pending';
+  };
+
   // --- LOADING UI ---
   if (currentStep !== 'form') {
     return (
       <div className="max-w-xl mx-auto bg-slate-800 rounded-2xl p-8 border border-slate-700 shadow-2xl">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-blue-500 border-r-transparent mx-auto mb-6"></div>
-          <h3 className="text-2xl font-bold text-white mb-2">
-            {currentStep === 'generating' && 'Step 1: Generating AI Questions...'}
-            {currentStep === 'storing' && 'Step 2: Uploading Assets to IPFS...'}
-            {currentStep === 'blockchain' && (isMiniPay ? 'Step 3: Confirm in MiniPay...' : 'Step 3: Confirm Wallet Transaction...')}
-          </h3>
-          <p className="text-slate-400">
-            {currentStep === 'generating' && 'This usually takes 5-10 seconds.'}
-            {currentStep === 'storing' && 'Securing your data...'}
-            {currentStep === 'blockchain' && 'Please verify the transaction in your wallet.'}
-          </p>
+        <div className="text-center mb-8">
+          <h3 className="text-2xl font-bold text-white">Creating Your Quiz</h3>
+          <p className="text-slate-400 mt-2">Please keep this window open</p>
+        </div>
+
+        <div className="space-y-6">
+            {/* Step 1: AI Generation */}
+            <StepItem 
+                status={getStepStatus('ai')} 
+                label="Generating Questions"
+                description="Curating questions using AI..."
+            />
+
+            {/* Step 2: Storage */}
+            <StepItem 
+                status={getStepStatus('ipfs')} 
+                label="Securing Assets"
+                description="Uploading metadata and image to IPFS..."
+            />
+
+            {/* Step 3: Blockchain */}
+            <StepItem 
+                status={getStepStatus('blockchain')} 
+                label="Minting on Celo"
+                description={isMiniPay ? "Please confirm transaction in MiniPay..." : "Check your wallet to sign..."}
+            />
         </div>
       </div>
     );
@@ -256,4 +289,37 @@ export function QuizGenerator({ onQuizGenerated, onCancel }: QuizGeneratorProps)
       </div>
     </div>
   );
+}
+
+// --- HELPER COMPONENT FOR PROGRESS ---
+function StepItem({ status, label, description }: { status: string, label: string, description: string }) {
+    return (
+        <div className={`flex items-start space-x-4 p-4 rounded-xl border transition-all duration-300 ${
+            status === 'active' 
+                ? 'bg-blue-500/10 border-blue-500/50' 
+                : status === 'completed'
+                ? 'bg-green-500/5 border-green-500/30'
+                : 'bg-slate-800 border-transparent opacity-50'
+        }`}>
+            <div className="flex-shrink-0 mt-1">
+                {status === 'active' && (
+                    <div className="w-6 h-6 rounded-full border-2 border-blue-500 border-t-transparent animate-spin"></div>
+                )}
+                {status === 'completed' && (
+                    <div className="w-6 h-6 rounded-full bg-green-500 flex items-center justify-center text-black font-bold">✓</div>
+                )}
+                {status === 'pending' && (
+                    <div className="w-6 h-6 rounded-full border-2 border-slate-600"></div>
+                )}
+            </div>
+            <div>
+                <h4 className={`font-bold ${
+                    status === 'active' ? 'text-blue-400' : status === 'completed' ? 'text-green-400' : 'text-slate-400'
+                }`}>
+                    {label}
+                </h4>
+                <p className="text-sm text-slate-400">{description}</p>
+            </div>
+        </div>
+    );
 }
