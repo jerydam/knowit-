@@ -9,6 +9,8 @@ import { sendTransactionWithDivvi } from '@/lib/divvi';
 import toast from 'react-hot-toast';
 
 const CUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a";
+const CELO_CHAIN_ID = 42220;
+const RPC_URL = "https://forno.celo.org"; // Stable Public RPC
 
 interface RewardsPanelProps {
   userAddress: string | null;
@@ -22,18 +24,53 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
   const [claimedNFTs, setClaimedNFTs] = useState<{ [quizId: string]: boolean }>({});
   const [error, setError] = useState<string | null>(null);
   const contractAddress = process.env.NEXT_PUBLIC_QUIZ_CONTRACT_ADDRESS || '';
-  const CELO_MAINNET_CHAIN_ID = celo.id;
 
+  // --- HELPER: SWITCH NETWORK ---
+  const switchNetwork = async () => {
+    if (!window.ethereum) return;
+    try {
+      // Try to switch
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: `0x${CELO_CHAIN_ID.toString(16)}` }],
+      });
+    } catch (switchError: any) {
+      // If chain missing, add it
+      if (switchError.code === 4902) {
+        try {
+          await window.ethereum.request({
+            method: 'wallet_addEthereumChain',
+            params: [
+              {
+                chainId: `0x${CELO_CHAIN_ID.toString(16)}`,
+                chainName: 'Celo Mainnet',
+                nativeCurrency: { name: 'CELO', symbol: 'CELO', decimals: 18 },
+                rpcUrls: [RPC_URL],
+                blockExplorerUrls: ['https://explorer.celo.org'],
+              },
+            ],
+          });
+        } catch (addError) {
+          console.error('Failed to add Celo network', addError);
+        }
+      }
+    }
+  };
+
+  const totalRewardsEarned = Object.values(claimedNFTs).filter(Boolean).length;
+  const totalPointsEarned = userScores.reduce((acc, score) => acc + score.score, 0);  // --- FETCH DATA (READ-ONLY) ---
   useEffect(() => {
     const fetchUserScores = async () => {
+      // 1. Safety Checks
       if (!userAddress || !contractAddress) return;
 
       try {
-        // Use Public RPC for reliable reading
-        const provider = new ethers.JsonRpcProvider("https://forno.celo.org");
+        // 2. Use Public RPC for Reading (Fixes "Live vs Local" diff)
+        // This ensures we always read from Celo, regardless of what network the user's wallet is on.
+        const provider = new ethers.JsonRpcProvider(RPC_URL);
         const contract = new ethers.Contract(contractAddress, QuizRewardsABI, provider);
         
-        // Get raw completions
+        // 3. Fetch Data
         const completions = await contract.getPlayerQuizCompletions(userAddress);
         
         if (!completions || completions.length === 0) {
@@ -47,7 +84,6 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
             const quizId = completion.quizId?.toString();
             if (!quizId) return null;
             
-            // Fetch metadata only if not already cached
             if (!quizMap.has(quizId)) {
               try {
                 const quizResponse = await fetch(`/api/quizzes?id=${quizId}`);
@@ -55,18 +91,15 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
                    const quizData = await quizResponse.json();
                    quizMap.set(quizId, quizData);
                 } else {
-                   // Fallback if API fails: Use ID as title
-                   console.warn(`Quiz API missing for ID: ${quizId}`);
                    quizMap.set(quizId, { title: `Quiz #${quizId}`, questions: [] }); 
                 }
               } catch (e) {
-                 quizMap.set(quizId, { title: `Quiz #${quizId} (Offline)`, questions: [] });
+                 quizMap.set(quizId, { title: `Quiz #${quizId}`, questions: [] });
               }
             }
             
             const quizData = quizMap.get(quizId);
             const scoreVal = Number(completion.score);
-            // If questions array is missing, assume totalQuestions = score (to allow displaying the result)
             const totalQ = quizData.questions?.length || scoreVal; 
 
             return {
@@ -85,19 +118,12 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
         setUserScores(validScores);
         setError(null);
 
-        // Check claimed status
+        // 4. Check Claimed Status (Safe with Public RPC)
         const claimed: { [quizId: string]: boolean } = {};
         for (const score of validScores) {
-          if (!score.quizId) continue;
-          // Only check claimed status for perfect scores
           if (score.score >= score.totalQuestions && score.totalQuestions > 0) {
              try {
                const hasCompleted = await contract.hasCompletedQuiz(userAddress, score.quizId);
-               // NOTE: Ideally check balanceOf or ownerOf for true NFT ownership, 
-               // but assuming logic implies completion = claimable/claimed context
-               // For this UI, we will assume if they finished it perfectly, they might have claimed it.
-               // To be 100% sure of "Claimed", we usually check if they own the token ID associated with the quiz.
-               // For now, using existing logic:
                claimed[score.quizId] = hasCompleted; 
              } catch (e) {
                console.error("Check claim failed", e);
@@ -108,16 +134,14 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
 
       } catch (err: any) {
         console.error('Error fetching scores:', err);
-        // Don't blocking error on UI, just log
-        // setError(`Could not load history: ${err.message}`);
+        setError(`Failed to load history: ${err.message}`);
       }
     };
+
     fetchUserScores();
   }, [userAddress, contractAddress]);
 
-  const totalRewardsEarned = Object.values(claimedNFTs).filter(Boolean).length;
-  const totalPointsEarned = userScores.reduce((acc, score) => acc + score.score, 0);
-
+  // --- CLAIM REWARD (WRITE) ---
   const handleClaimReward = async (scoreId: string) => {
     if (!isConnected || !userAddress) {
       toast.error('Please connect your wallet.');
@@ -129,11 +153,14 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
 
     try {
       let txHash;
+
       // MINIPAY LOGIC
       if (isMiniPay) {
+        if (!window.ethereum) throw new Error("MiniPay not found");
+        
         const walletClient = createWalletClient({
           chain: celo,
-          transport: custom(window.ethereum!),
+          transport: custom(window.ethereum),
         });
 
         console.log('MiniPay Claiming ID:', scoreId);
@@ -143,27 +170,23 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
             abi: QuizRewardsABI,
             functionName: 'claimNFTReward',
             account: userAddress as `0x${string}`,
-            args: [BigInt(scoreId)], // ID must be passed correctly
+            args: [BigInt(scoreId)],
             feeCurrency: CUSD_ADDRESS as `0x${string}`
         });
 
       } else {
-        // STANDARD LOGIC
-        const provider = new ethers.BrowserProvider(window.ethereum!);
-        const network = await provider.getNetwork();
-        
-        if (Number(network.chainId) !== CELO_MAINNET_CHAIN_ID) {
-             await window.ethereum!.request({
-               method: 'wallet_switchEthereumChain',
-               params: [{ chainId: `0x${CELO_MAINNET_CHAIN_ID.toString(16)}` }],
-             });
-        }
+        // STANDARD BROWSER LOGIC
+        if (!window.ethereum) throw new Error("Wallet not found");
 
+        // 1. AUTO-SWITCH NETWORK
+        await switchNetwork();
+
+        const provider = new ethers.BrowserProvider(window.ethereum);
         const signer = await provider.getSigner();
         const contract = new ethers.Contract(contractAddress, QuizRewardsABI, signer);
         const walletClient = createWalletClient({
             chain: celo,
-            transport: custom(window.ethereum!)
+            transport: custom(window.ethereum)
         });
 
         txHash = await sendTransactionWithDivvi(
@@ -177,7 +200,6 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
 
       toast.success('NFT Claimed Successfully! 🎉', { id: loadingToast });
       setClaimedNFTs(prev => ({ ...prev, [scoreId]: true }));
-      console.log("Claim Tx:", txHash);
 
     } catch (err: any) {
       console.error('Claim error:', err);
@@ -201,7 +223,8 @@ export function RewardsPanel({ userAddress, isConnected, isMiniPay = false }: Re
     <div className="space-y-8">      
       {error && (
         <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-red-300 text-sm text-center">
-           <p>{error}</p>
+          <p className="font-bold">Error Loading Data:</p>
+          <p>{error}</p>
         </div>
       )}
       

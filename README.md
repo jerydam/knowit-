@@ -1,6 +1,3 @@
-Here is a professional, comprehensive **README.md** file for your project.
-
-It is structured to explain **what the project is**, **how to run it**, and specifically **how to test the MiniPay integration**.
 
 -----
 
